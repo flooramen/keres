@@ -65,7 +65,7 @@ pub enum PayloadType {
 }
 
 impl PayloadType {
-    fn context(self) -> Vec<u8> {
+    pub(crate) fn context(self) -> Vec<u8> {
         let mut c = b"keres-container-v1/".to_vec();
         c.extend_from_slice(match self {
             PayloadType::File => &b"file"[..],
@@ -116,7 +116,7 @@ impl KeyDerivation {
             }
     }
 
-    fn write_header<W: Write>(&self, w: &mut W) -> Result<()> {
+    pub(crate) fn write_header<W: Write>(&self, w: &mut W) -> Result<()> {
         let mut head = Vec::with_capacity(self.header_len());
         head.extend_from_slice(MAGIC);
         head.extend_from_slice(&ENVELOPE_VERSION.to_le_bytes());
@@ -139,7 +139,7 @@ impl KeyDerivation {
         Ok(())
     }
 
-    fn parse_header(head: &[u8]) -> Result<Self> {
+    pub(crate) fn parse_header(head: &[u8]) -> Result<Self> {
         if head.len() < MAGIC.len() + 3 || &head[..MAGIC.len()] != MAGIC {
             return Err(Error::IncompatibleFormat);
         }
@@ -176,7 +176,7 @@ impl KeyDerivation {
         }
     }
 
-    fn content_key(
+    pub(crate) fn content_key(
         &self,
         password: Option<&str>,
         master: Option<&Key>,
@@ -225,6 +225,112 @@ fn trailer_aad(context: &[u8]) -> Vec<u8> {
     aad
 }
 
+/// Reads a container header (magic, version, kind byte, kind data).
+///
+/// Shared by the whole-container reader and the public streaming reader, so
+/// both accept exactly the same envelope.
+pub(crate) fn read_header<R: Read>(inner: &mut R) -> Result<KeyDerivation> {
+    let mut first = vec![0u8; MAGIC.len() + 3];
+    inner
+        .read_exact(&mut first)
+        .map_err(|_| Error::InvalidHeader)?;
+    if &first[..MAGIC.len()] != MAGIC {
+        return Err(Error::IncompatibleFormat);
+    }
+    let extra = match first[10] {
+        KIND_HKDF => SALT_LEN,
+        KIND_PASSWORD => 2 * SALT_LEN + KdfParams::SERIALIZED_LEN,
+        _ => return Err(Error::InvalidHeader),
+    };
+    let mut rest = vec![0u8; extra];
+    inner
+        .read_exact(&mut rest)
+        .map_err(|_| Error::InvalidHeader)?;
+    first.extend_from_slice(&rest);
+    KeyDerivation::parse_header(&first)
+}
+
+/// Writes the authenticated trailer record, including the end-of-chunks
+/// marker that precedes it.
+pub(crate) fn write_trailer<W: Write>(
+    dst: &mut W,
+    content_key: &Key,
+    typ: PayloadType,
+    name: Option<&str>,
+    size: u64,
+    chunk_count: u32,
+) -> Result<()> {
+    let context = typ.context();
+    let mut payload = Zeroizing::new(
+        serde_json::to_vec(&Trailer {
+            typ,
+            name: name.map(String::from),
+            size,
+            chunk_count,
+        })
+        .map_err(|_| Error::Encryption)?,
+    );
+    crypto::seal_in_place(
+        &stream::TRAILER_NONCE,
+        &mut payload,
+        content_key,
+        &trailer_aad(&context),
+    )?;
+    dst.write_all(&stream::CHUNKS_END_MARKER)?;
+    dst.write_all(&(payload.len() as u32).to_le_bytes())?;
+    dst.write_all(payload.as_slice())?;
+    Ok(())
+}
+
+/// Reads and authenticates the trailer record and checks its payload type.
+///
+/// Size and chunk-count consistency with the observed chunks is left to the
+/// caller, which knows how much plaintext it produced.
+pub(crate) fn read_trailer<R: Read>(
+    src: &mut R,
+    content_key: &Key,
+    expected: PayloadType,
+) -> Result<Trailer> {
+    let context = expected.context();
+    let mut rec = Zeroizing::new(stream::read_record(src, stream::MAX_TRAILER_LEN)?);
+    crypto::open_in_place(
+        &stream::TRAILER_NONCE,
+        &mut rec,
+        content_key,
+        &trailer_aad(&context),
+    )?;
+    let trailer: Trailer =
+        serde_json::from_slice(rec.as_slice()).map_err(|_| Error::MalformedPayload)?;
+    if trailer.typ != expected {
+        return Err(Error::Authentication);
+    }
+    Ok(trailer)
+}
+
+/// Rejects bytes after a container's trailer.
+pub(crate) fn ensure_eof<R: Read>(inner: &mut R) -> Result<()> {
+    let mut probe = [0u8; 1];
+    match inner.read(&mut probe) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Error::InvalidHeader),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Generates the password-based key derivation used by standalone `.krs`
+/// containers.
+pub(crate) fn password_key_derivation() -> KeyDerivation {
+    let mut argon_salt = [0u8; SALT_LEN];
+    let mut object_salt = [0u8; SALT_LEN];
+    crypto::fill_random(&mut argon_salt);
+    crypto::fill_random(&mut object_salt);
+    KeyDerivation::Password {
+        argon_salt,
+        object_salt,
+        params: KdfParams::new(),
+    }
+}
+
 /// Writes a complete container: header, chunks streamed from `src`, then
 /// the authenticated trailer. Returns `(plaintext_bytes, chunk_count)`.
 ///
@@ -253,24 +359,7 @@ pub(crate) fn write_container<W: Write>(
         None => (0, 0),
     };
 
-    let mut payload = Zeroizing::new(
-        serde_json::to_vec(&Trailer {
-            typ,
-            name: trailer_name.map(String::from),
-            size: total,
-            chunk_count: count,
-        })
-        .map_err(|_| Error::Encryption)?,
-    );
-    crypto::seal_in_place(
-        &stream::TRAILER_NONCE,
-        &mut payload,
-        &content_key,
-        &trailer_aad(&context),
-    )?;
-    dst.write_all(&stream::CHUNKS_END_MARKER)?;
-    dst.write_all(&(payload.len() as u32).to_le_bytes())?;
-    dst.write_all(payload.as_slice())?;
+    write_trailer(dst, &content_key, typ, trailer_name, total, count)?;
     Ok((total, count))
 }
 
@@ -285,51 +374,18 @@ pub(crate) fn read_container<R: Read>(
     identity: &[u8],
     sink: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<Trailer> {
-    let mut first = vec![0u8; MAGIC.len() + 3];
-    inner
-        .read_exact(&mut first)
-        .map_err(|_| Error::InvalidHeader)?;
-    if &first[..MAGIC.len()] != MAGIC {
-        return Err(Error::IncompatibleFormat);
-    }
-    let extra = match first[10] {
-        KIND_HKDF => SALT_LEN,
-        KIND_PASSWORD => 2 * SALT_LEN + KdfParams::SERIALIZED_LEN,
-        _ => return Err(Error::InvalidHeader),
-    };
-    let mut rest = vec![0u8; extra];
-    inner
-        .read_exact(&mut rest)
-        .map_err(|_| Error::InvalidHeader)?;
-    first.extend_from_slice(&rest);
-
-    let kd = KeyDerivation::parse_header(&first)?;
+    let kd = read_header(&mut inner)?;
     let content_key = kd.content_key(password, master, identity)?;
     let context = expected.context();
 
     let (total, count) = stream::read_chunks(&mut inner, &content_key, &context, sink)?;
+    let trailer = read_trailer(&mut inner, &content_key, expected)?;
 
-    let mut rec = Zeroizing::new(stream::read_record(&mut inner, stream::MAX_TRAILER_LEN)?);
-    crypto::open_in_place(
-        &stream::TRAILER_NONCE,
-        &mut rec,
-        &content_key,
-        &trailer_aad(&context),
-    )?;
-    let trailer: Trailer =
-        serde_json::from_slice(rec.as_slice()).map_err(|_| Error::MalformedPayload)?;
-
-    if trailer.typ != expected || trailer.size != total || trailer.chunk_count != count {
+    if trailer.size != total || trailer.chunk_count != count {
         return Err(Error::Authentication);
     }
 
-    // Nothing may follow the trailer.
-    let mut probe = [0u8; 1];
-    match inner.read(&mut probe) {
-        Ok(0) => {}
-        Ok(_) => return Err(Error::InvalidHeader),
-        Err(e) => return Err(e.into()),
-    }
+    ensure_eof(&mut inner)?;
     Ok(trailer)
 }
 

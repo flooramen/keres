@@ -106,6 +106,8 @@ pub mod sanitize;
 mod single_file;
 /// Chunked streaming encryption engine.
 mod stream;
+/// Public `Read`/`Write` streaming adapters.
+pub mod streaming;
 /// Deterministic containers that pin the wire format.
 #[doc(hidden)]
 pub mod test_vectors;
@@ -117,6 +119,9 @@ pub mod prelude {
     pub use crate::crypto::Key;
     pub use crate::error::{Error, Result};
     pub use crate::single_file::{decrypt_file, encrypt_file};
+    pub use crate::streaming::{
+        decrypt_stream, encrypt_stream, DecryptReader, EncryptWriter, StreamInfo, StreamOptions,
+    };
     pub use crate::vault::{
         EntryInfo, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, RotationReport,
         Vault,
@@ -125,6 +130,9 @@ pub mod prelude {
 
 pub use error::{Error, Result};
 pub use single_file::{decrypt_file, encrypt_file};
+pub use streaming::{
+    decrypt_stream, encrypt_stream, DecryptReader, EncryptWriter, StreamInfo, StreamOptions,
+};
 pub use vault::{
     EntryInfo, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, RotationReport, Vault,
 };

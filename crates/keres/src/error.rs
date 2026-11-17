@@ -96,6 +96,11 @@ pub enum Error {
     /// confirmation mismatch).
     #[error("{0}")]
     Operation(String),
+
+    /// A streaming operation was cancelled through
+    /// [`crate::streaming::StreamOptions`].
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl Error {

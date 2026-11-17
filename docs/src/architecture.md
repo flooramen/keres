@@ -225,6 +225,32 @@ it, and returns it. Plaintext is written via temp+rename as well.
 Memory use is bounded by one chunk buffer (+tag) regardless of file size;
 multi-gigabyte files stream at constant memory.
 
+### Streaming API
+
+`keres::streaming` exposes the same wire format to library code that does not
+have files:
+
+| Type / function | Direction |
+|---|---|
+| `EncryptWriter` | `Write`: plaintext in, ciphertext out; `finish()` writes the trailer |
+| `DecryptReader` | `Read`: ciphertext in, authenticated plaintext out; EOF verifies the trailer |
+| `encrypt_stream` / `decrypt_stream` | Convenience loops that keep the typed `Error` |
+
+`StreamOptions` adds a cumulative-byte progress callback and an
+`AtomicBool` cancellation flag polled once per chunk. Cancellation returns
+`Error::Cancelled`; through the `io` adapters it is wrapped in an
+`io::Error`, with the typed error recoverable from its source.
+
+Every chunk is authenticated before its plaintext is yielded, but the trailer
+holds the total size and chunk count, so a truncated or trailer-tampered
+stream can deliver authenticated plaintext before the final error. File
+writers should therefore stage output through temp+rename, exactly as
+`decrypt_file` does. This is an inherent property of streaming, not a laxity
+in the chunk authentication.
+
+The adapters and functions are format-compatible with `encrypt_file` and
+`decrypt_file` in both directions.
+
 ---
 
 ## Vault mode
@@ -460,6 +486,7 @@ One enum (`Error`, thiserror), `Result<T> = std::result::Result<T, Error>`:
 | `InvalidVault` | vault structure problems (bad config, damaged manifest) |
 | `VaultLocked` / `VaultUnlocked` | state-machine misuse |
 | `VaultBusy` | another process holds the vault lock |
+| `Cancelled` | a streaming operation was stopped by its cancellation flag |
 | `EntryExists` / `EntryNotFound` | name conflicts |
 | `InvalidName(String)` | validation failure (preview truncated to 32 chars) |
 | `Io(std::io::Error)` | filesystem layer |

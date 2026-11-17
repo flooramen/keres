@@ -36,7 +36,7 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 /// Upper bound accepted for a trailer record (hostile-input guard).
 pub(crate) const MAX_TRAILER_LEN: usize = 1024 * 1024;
 /// Sanity cap on chunk count (~1 TiB with 64 KiB chunks).
-const MAX_CHUNK_COUNT: u32 = 1 << 24;
+pub(crate) const MAX_CHUNK_COUNT: u32 = 1 << 24;
 
 /// Reserved nonce used exclusively by the trailer record.
 pub(crate) const TRAILER_NONCE: crypto::Nonce12 = [0xFFu8; 12];
@@ -59,6 +59,63 @@ pub(crate) fn read_record<R: Read>(r: &mut R, max: usize) -> Result<Vec<u8>> {
     let mut rec = vec![0u8; len];
     r.read_exact(&mut rec)?;
     Ok(rec)
+}
+
+/// Encrypts one buffered chunk and writes `[len u32 LE][ciphertext || tag]`.
+///
+/// `buf` holds plaintext on entry and ciphertext (plus tag) on return.
+pub(crate) fn seal_chunk<W: Write>(
+    dst: &mut W,
+    key: &Key,
+    context: &[u8],
+    index: u32,
+    buf: &mut Zeroizing<Vec<u8>>,
+) -> Result<()> {
+    crypto::seal_in_place(&chunk_nonce(index), buf, key, &chunk_aad(context, index))?;
+    dst.write_all(&(buf.len() as u32).to_le_bytes())?;
+    dst.write_all(buf)?;
+    Ok(())
+}
+
+/// Reads and authenticates one chunk.
+///
+/// Returns `None` at the end-of-chunks marker, leaving the stream positioned
+/// at the trailer record. Rejects oversized length prefixes before
+/// allocation and requires the length to cover a tag and at most
+/// [`CHUNK_SIZE`] plaintext bytes.
+pub(crate) fn read_chunk<R: Read>(
+    src: &mut R,
+    key: &Key,
+    context: &[u8],
+    index: u32,
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    let mut len_bytes = [0u8; 4];
+    match src.read_exact(&mut len_bytes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(Error::InvalidHeader); // missing trailer entirely
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    if len_bytes == CHUNKS_END_MARKER {
+        return Ok(None);
+    }
+
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if !(TAG_LEN..=CHUNK_SIZE + TAG_LEN).contains(&len) {
+        return Err(Error::InvalidHeader);
+    }
+
+    let mut rec = Zeroizing::new(vec![0u8; len]);
+    src.read_exact(rec.as_mut())?;
+    crypto::open_in_place(
+        &chunk_nonce(index),
+        &mut rec,
+        key,
+        &chunk_aad(context, index),
+    )?;
+    Ok(Some(rec))
 }
 
 /// Encrypts everything readable from `src` into `dst` as chunk records.
@@ -85,15 +142,7 @@ pub(crate) fn write_chunks<W: Write>(
             break;
         }
 
-        crypto::seal_in_place(
-            &chunk_nonce(count),
-            &mut buf,
-            key,
-            &chunk_aad(context, count),
-        )?;
-
-        dst.write_all(&(buf.len() as u32).to_le_bytes())?;
-        dst.write_all(&buf)?;
+        seal_chunk(dst, key, context, count, &mut buf)?;
 
         total += n as u64;
         count += 1;
@@ -133,40 +182,17 @@ pub(crate) fn read_chunks<R: Read>(
     let mut count: u32 = 0;
 
     loop {
-        let mut len_bytes = [0u8; 4];
-        match src.read_exact(&mut len_bytes) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(Error::InvalidHeader); // missing trailer entirely
+        match read_chunk(src, key, context, count)? {
+            Some(rec) => {
+                // After in-place decryption the buffer holds plaintext only.
+                sink(&rec)?;
+                total += rec.len() as u64;
+                count += 1;
+                if count >= MAX_CHUNK_COUNT {
+                    return Err(Error::InvalidHeader);
+                }
             }
-            Err(e) => return Err(e.into()),
-        }
-
-        if len_bytes == CHUNKS_END_MARKER {
-            return Ok((total, count));
-        }
-
-        let len = u32::from_le_bytes(len_bytes) as usize;
-        if !(TAG_LEN..=CHUNK_SIZE + TAG_LEN).contains(&len) {
-            return Err(Error::InvalidHeader);
-        }
-
-        let mut rec = Zeroizing::new(vec![0u8; len]);
-        src.read_exact(rec.as_mut())?;
-
-        crypto::open_in_place(
-            &chunk_nonce(count),
-            &mut rec,
-            key,
-            &chunk_aad(context, count),
-        )?;
-        // After in-place decryption the buffer holds plaintext only.
-        sink(&rec)?;
-
-        total += (len - TAG_LEN) as u64;
-        count += 1;
-        if count >= MAX_CHUNK_COUNT {
-            return Err(Error::InvalidHeader);
+            None => return Ok((total, count)),
         }
     }
 }

@@ -40,6 +40,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   index. The new config has one keyslot under the new password, so extra
   keyslots and any recovery kit are invalidated. A `vault.rotate` journal
   lets the next open finish or roll back an interrupted run.
+- Streaming API: `keres::streaming` provides `EncryptWriter` / `DecryptReader`
+  `io::Write` / `io::Read` adapters plus `encrypt_stream` / `decrypt_stream`.
+  `StreamOptions` supports a cumulative-byte progress callback and an
+  `AtomicBool` cancellation flag; cancellation reports the new
+  `Error::Cancelled`. Output is format-compatible with `encrypt_file` and
+  `decrypt_file`.
 - CLI password sources: `--password-file` and `--password-stdin`, with all
   password buffers zeroized. `--force` and an interactive confirmation guard
   destructive operations.

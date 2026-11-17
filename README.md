@@ -59,10 +59,12 @@ vault.lock();
 ```
 
 The public API lives in `keres::*` (`encrypt_file`, `decrypt_file`,
-`Vault`, `EntryInfo`, `IntegrityReport`, `KeyslotInfo`, `MigrationReport`,
-`RecoveryCode`), with lower-level building blocks in
-`keres::crypto`, `keres::kdf`, `keres::sanitize`, and `keres::error`.
-Run `cargo doc -p keres --open` for the full API reference.
+`encrypt_stream`, `decrypt_stream`, `Vault`, `EntryInfo`, `IntegrityReport`,
+`KeyslotInfo`, `MigrationReport`, `RecoveryCode`, `RotationReport`), with
+lower-level building blocks in `keres::crypto`, `keres::kdf`,
+`keres::sanitize`, and `keres::error`. `keres::streaming` also exposes
+`EncryptWriter` / `DecryptReader` `io` adapters with progress and
+cancellation. Run `cargo doc -p keres --open` for the full API reference.
 
 ## Design in one paragraph
 

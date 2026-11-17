@@ -25,8 +25,8 @@ matters most for the monorepo.
       (stable IDs, atomic manifest cut-over, legacy blobs removed).
 - [x] Decouple entry identity from the mutable path (stable random IDs), so
       `rename` does not require re-encryption.
-- [ ] Public streaming API (`Read`/`Write` adapters), progress, and
-      cancellation.
+- [x] Public streaming API (`Read`/`Write` adapters), progress, and
+      cancellation (`keres::streaming`, `EncryptWriter`/`DecryptReader`).
 - [ ] Entry metadata (mtime, mode) and `list --recursive` / `stat`.
 - [x] Printable recovery kit (`keres recovery create` / `recovery use`,
       `Vault::create_recovery_kit` / `Vault::recover`).

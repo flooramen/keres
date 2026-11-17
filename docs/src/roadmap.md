@@ -60,7 +60,9 @@ property will never be accepted for a compatibility or convenience win.
   (counter nonces and AAD already make chunks independent). Target:
   saturate AES-NI (~3–5 GB/s) instead of today's ~400 MB/s single-thread.
 - **Streaming public API** — `Read`/`Write` adapter types so library users
-  can pipe containers without buffering whole objects.
+  can pipe containers without buffering whole objects. *(Done.
+  `keres::streaming::{EncryptWriter, DecryptReader, encrypt_stream,
+  decrypt_stream}` with progress and cancellation.)*
 - **Orphan garbage collection** — after failed adds/removals, blobs may
   exist that no manifest record references. `verify --prune` /
   `Vault::prune_orphans` walks `d/` and deletes unreferenced blobs and stale
