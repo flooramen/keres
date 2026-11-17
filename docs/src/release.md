@@ -48,8 +48,11 @@ cannot be published before the matching `keres` version is live.
   SHA-256 checksums, build-provenance attestations, and a GitHub Release.
 - CI now runs doctests and `cargo-deny`, and the MSRV is 1.85.
 - **Upgrade note:** vaults written by 0.5.0 use manifest v2 and are rejected
-  by 0.6.0. `keres migrate` is required before the 0.6.0 tag; until then,
-  extract with 0.5.0 before upgrading.
+  by the 0.6.0 reader. Back up the vault directory, then run
+  `keres migrate <vault>`. Migration re-encrypts each entry in place, keeps
+  the same password, commits the v3 manifest atomically, and removes the
+  legacy blobs. It is one-way; verify the upgraded vault before deleting the
+  backup.
 
 ## 0.5.0
 

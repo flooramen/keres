@@ -96,7 +96,9 @@ Rules that keep this stable:
    new trailer types with new context strings.
 3. Only the current Keres format is accepted. Any other magic returns
    `Error::IncompatibleFormat`; extract old data with the release that wrote
-   it before upgrading.
+   it before upgrading. Vault manifests are the exception: a 0.5.x (manifest
+   v2) vault returns `MigrationRequired` and is upgraded in place by
+   `keres migrate` / `Vault::migrate`.
 
 ## Verification API
 

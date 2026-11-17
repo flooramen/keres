@@ -45,6 +45,30 @@ pub(crate) fn write_entry(
     meta: &EntryMetadata,
     source: Option<&Path>,
 ) -> Result<PathBuf> {
+    let mut src_file;
+    let src: Option<&mut dyn Read> = match source {
+        Some(p) => {
+            src_file = File::open(p)?;
+            Some(&mut src_file)
+        }
+        None => None,
+    };
+    write_entry_from_reader(vault_dir, master, entry_id, meta, src)
+}
+
+/// Encrypts an entry from an arbitrary reader into a new-format blob.
+///
+/// This is the streaming core behind [`write_entry`]; `source: None` writes a
+/// chunk-less directory placeholder. The output is written via temp file +
+/// rename, so a crash can never leave a half-written entry that the manifest
+/// references.
+pub(crate) fn write_entry_from_reader(
+    vault_dir: &Path,
+    master: &Key,
+    entry_id: &str,
+    meta: &EntryMetadata,
+    source: Option<&mut dyn Read>,
+) -> Result<PathBuf> {
     let target = blob_path(vault_dir, master, entry_id);
     if let Some(parent) = target.parent() {
         crate::fsutil::create_private_dir(parent)?;
@@ -64,14 +88,6 @@ pub(crate) fn write_entry(
         let mut out_file = crate::fsutil::create_private_file(&tmp)?;
         {
             let mut w = BufWriter::new(&mut out_file);
-            let mut src_file;
-            let src: Option<&mut dyn Read> = match source {
-                Some(p) => {
-                    src_file = File::open(p)?;
-                    Some(&mut src_file)
-                }
-                None => None,
-            };
             container::write_container(
                 &mut w,
                 &kd,
@@ -79,7 +95,7 @@ pub(crate) fn write_entry(
                 Some(master),
                 typ,
                 entry_id.as_bytes(),
-                src,
+                source,
                 None,
             )?;
             w.flush()?;

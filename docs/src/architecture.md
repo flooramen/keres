@@ -99,7 +99,8 @@ Any file whose magic is not exactly `KERES\0\0\0` is rejected with
 Krypton formats, and unrelated files. Only the current Keres format is
 accepted; extract old data with the release that wrote it. A header with the
 right magic but a newer envelope version fails early with
-`UnsupportedVersion(v)`.
+`UnsupportedVersion(v)`. Vaults are the one exception: a readable 0.5.x vault
+manifest is reported as `MigrationRequired` and upgraded by `keres migrate`.
 
 ### Trailer
 
@@ -283,9 +284,12 @@ The index is a `BTreeMap<String, EntryMetadata>` serialized to JSON
 `{"version":3,"files":{...}}`, then stored as a kind-0 container with payload
 type `Manifest`. Each `EntryMetadata` records a non-empty 128-bit hex `id`,
 the original name, size, directory flag, and child lists for directories.
-Version 2 manifests are rejected (`UnsupportedVersion`), and a version 3
-manifest with an empty ID is rejected as `InvalidVault`; IDs are the root of
-blob identity, so a missing one cannot be repaired safely.
+Version 2 manifests are rejected by the reader with `MigrationRequired`
+(and an empty ID in a version 3 manifest is rejected as `InvalidVault`; IDs
+are the root of blob identity, so a missing one cannot be repaired safely).
+`Vault::migrate` / `keres migrate` upgrades a v2 vault in place: it
+re-encrypts every entry under a fresh ID, then commits the v3 manifest
+atomically. A failure before that commit leaves the legacy manifest intact.
 
 Load semantics (hardened after audit finding #1):
 
@@ -313,6 +317,7 @@ rewritten wholesale (temp+rename), never mutated in place.
 | `change_password(old,new)` | verifies old, re-wraps same master; ciphertext untouched |
 | `verify(pw)` | decrypts every blob (type-checked), cross-checks manifest presence; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
 | `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no manifest record references; refuses if the manifest is missing |
+| `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the manifest atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |
 
 Directory removal walks the manifest's own child lists, so removing a
 directory removes everything beneath it even if nested names were added
@@ -366,6 +371,7 @@ One enum (`Error`, thiserror), `Result<T> = std::result::Result<T, Error>`:
 | `Authentication` | wrong password/key **or** any tampering — indistinguishable on purpose |
 | `InvalidHeader` | malformed kind, lengths, or trailer |
 | `UnsupportedVersion(u32)` | envelope/schema/config version newer than supported |
+| `MigrationRequired` | legacy vault manifest; run `keres migrate` |
 | `IncompatibleFormat` | file is not a current Keres container |
 | `InvalidVault` | vault structure problems (bad config, damaged manifest) |
 | `VaultLocked` / `VaultUnlocked` | state-machine misuse |

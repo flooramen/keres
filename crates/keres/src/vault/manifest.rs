@@ -61,6 +61,15 @@ fn manifest_path(vault_dir: &Path) -> std::path::PathBuf {
     vault_dir.join("d").join(".manifest.enc")
 }
 
+/// A decoded manifest, tagged by its on-disk schema version.
+pub(crate) enum ManifestContents {
+    /// Legacy 0.4/0.5 index: blobs are addressed by entry path and entries
+    /// carry no stable ID.
+    V2(ManifestMap),
+    /// Current index: every entry carries a stable random ID.
+    V3(ManifestMap),
+}
+
 /// Loads the manifest, fully authenticating its container.
 ///
 /// A *missing* manifest yields an empty index; anything present but damaged,
@@ -85,6 +94,39 @@ pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
 /// Decodes and authenticates manifest bytes. Shared by [`load`] and the
 /// hidden fuzz entry point.
 pub(crate) fn decode(bytes: &[u8], master: &Key) -> Result<ManifestMap> {
+    match decode_contents(bytes, master)? {
+        ManifestContents::V2(_) => Err(Error::MigrationRequired),
+        ManifestContents::V3(files) => Ok(files),
+    }
+}
+
+/// Loads a legacy manifest for the one-way upgrade path.
+///
+/// Unlike [`load`], a missing manifest is an error: migration must never
+/// mistake an empty data directory for a complete legacy index.
+pub(crate) fn load_legacy_v2(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
+    let path = manifest_path(vault_dir);
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::InvalidVault),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut bytes = Vec::new();
+    file.take(MAX_MANIFEST_LEN)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::InvalidVault)?;
+
+    match decode_contents(&bytes, master)? {
+        ManifestContents::V2(files) => Ok(files),
+        ManifestContents::V3(_) => Err(Error::Operation(
+            "vault already uses the current format".into(),
+        )),
+    }
+}
+
+/// Decodes the authenticated JSON without enforcing a particular version.
+fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
     if bytes.len() as u64 > MAX_MANIFEST_LEN {
         return Err(Error::InvalidVault);
     }
@@ -104,13 +146,18 @@ pub(crate) fn decode(bytes: &[u8], master: &Key) -> Result<ManifestMap> {
 
     let manifest: ManifestFile =
         serde_json::from_slice(json.as_slice()).map_err(|_| Error::MalformedPayload)?;
-    if manifest.version != MANIFEST_VERSION {
-        return Err(Error::UnsupportedVersion(manifest.version));
+    match manifest.version {
+        // Legacy entries deserialize with an empty `id`; migration allocates
+        // fresh IDs rather than trusting anything on disk.
+        2 => Ok(ManifestContents::V2(manifest.files)),
+        MANIFEST_VERSION => {
+            if manifest.files.values().any(|entry| entry.id.is_empty()) {
+                return Err(Error::InvalidVault);
+            }
+            Ok(ManifestContents::V3(manifest.files))
+        }
+        other => Err(Error::UnsupportedVersion(other)),
     }
-    if manifest.files.values().any(|entry| entry.id.is_empty()) {
-        return Err(Error::InvalidVault);
-    }
-    Ok(manifest.files)
 }
 
 /// Atomically saves the manifest as a fresh container (new object salt on

@@ -38,6 +38,9 @@ pub(crate) mod file_ops;
 pub(crate) mod keystore;
 pub(crate) mod lock;
 pub(crate) mod manifest;
+pub(crate) mod migrate;
+
+pub use migrate::MigrationReport;
 
 use file_ops as blobs;
 use keystore::{KeyStore, VaultConfig};
@@ -488,6 +491,35 @@ impl Vault {
             }
         }
         Ok(dest.to_path_buf())
+    }
+
+    /// Upgrades a vault written by 0.5.x (manifest v2) to the current format.
+    ///
+    /// Every entry is re-encrypted under a fresh stable ID and the v3 manifest
+    /// is committed atomically. The password and master key are unchanged:
+    /// this is a format upgrade, not key rotation. A failure before that
+    /// commit leaves the legacy vault readable: either run migration again,
+    /// or reclaim any unreferenced blobs with [`Vault::prune_orphans`].
+    ///
+    /// Fails with [`Error::Operation`] if the vault already uses the current
+    /// format.
+    ///
+    /// ```no_run
+    /// use keres::Vault;
+    ///
+    /// let mut vault = Vault::new("old-vault".into());
+    /// let report = vault.migrate("correct horse")?;
+    /// println!("migrated {} entries ({} bytes)", report.entries, report.bytes);
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn migrate(&mut self, password: &str) -> Result<MigrationReport> {
+        if !self.exists() {
+            return Err(Error::VaultNotFound);
+        }
+        let _lock = VaultLock::exclusive(&self.path)?;
+        let config = self.load_config()?;
+        let master = config.unwrap_master_key(password)?;
+        migrate::run(&self.path, &master)
     }
 
     /// Changes the vault password after verifying `old_password`.

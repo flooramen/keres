@@ -29,6 +29,7 @@ $ keres list personal
 $ keres extract personal photos ./restored
 $ keres verify personal
 $ keres verify personal --prune
+$ keres migrate legacy-vault
 $ keres change-password personal
 $ keres remove personal notes.txt
 ```
@@ -45,16 +46,22 @@ $ keres remove personal notes.txt
 | `list <vault>` | List top-level entries |
 | `extract <vault> <name> <dest> [--force]` | Restore an entry |
 | `verify <vault> [--prune]` | Authenticate every entry; `--prune` deletes unreferenced blobs |
+| `migrate <vault> [--force]` | Upgrade a 0.5.x (manifest v2) vault to the current format |
 | `change-password <vault>` | Re-wrap the master key under a new password |
 | `encrypt <input> [output] [--force]` | Encrypt one file |
 | `decrypt <input> <output> [--force]` | Decrypt one file |
 
 ## Overwriting and destructive operations
 
-`remove` asks for confirmation on a terminal and refuses to run without
-`--force` when standard input is not a terminal. `extract`, `encrypt`, and
-`decrypt` refuse to overwrite an existing destination unless `--force` is
-given.
+`remove` and `migrate` ask for confirmation on a terminal and refuse to run
+without `--force` when standard input is not a terminal. `extract`,
+`encrypt`, and `decrypt` refuse to overwrite an existing destination unless
+`--force` is given.
+
+`migrate` upgrades a vault written by 0.5.x (manifest v2). It re-encrypts
+every entry in place, keeps the same password, commits the v3 manifest
+atomically, and then deletes the legacy blobs. Back up the vault directory
+first; the upgrade is one-way.
 
 `verify --prune` deletes ciphertext blobs under `d/` that no manifest entry
 references (left behind by an interrupted add) and cleans up stale temp

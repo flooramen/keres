@@ -37,10 +37,10 @@ property will never be accepted for a compatibility or convenience win.
 
 ## Next (0.6.x)
 
-- **v2 → v3 vault migration (0.6.0 blocker)** — 0.5.0 vaults use manifest v2
-  and are rejected by the v3 reader. Add `keres migrate` to stream each blob
-  into a fresh v3 vault with an atomic swap, and make the version error point
-  at it.
+- **v2 → v3 vault migration** — 0.5.0 vaults use manifest v2 and are
+  rejected by the v3 reader. *(Done. `Vault::migrate` / `keres migrate`
+  re-encrypts each entry under a fresh ID, commits the v3 manifest atomically,
+  then removes the legacy blobs; the reader reports `MigrationRequired`.)*
 - **Recovery kit** — printable recovery code that wraps the master key
   under a second Argon2id-derived key, stored alongside `vault.config`.
   Mitigates the "one config file bricks everything" failure mode without
@@ -92,5 +92,6 @@ property will never be accepted for a compatibility or convenience win.
   hidden-volume schemes conflict with authenticated formats and invite
   user-error catastrophes. Revisit only with a rigorous design.
 - **Backward compatibility shims** — only the current format is accepted.
-  Migration is a one-time `keres migrate` helper only if demand exists.
+  The single exception is the one-way v2 → v3 vault upgrade in
+  `keres migrate`; there is no ongoing reader support for old formats.
 

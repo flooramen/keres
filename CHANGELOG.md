@@ -19,6 +19,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Vault::rename` / `keres rename` renames a top-level file or directory
   without re-encrypting it. Entries now carry a stable 128-bit random ID, and
   blob paths plus container AAD derive from that ID rather than the path.
+- `Vault::migrate` / `keres migrate` upgrades a 0.5.0 (manifest v2) vault in
+  place: every entry is re-encrypted under a fresh stable ID, the v3 manifest
+  is committed atomically, and legacy path-addressed blobs are removed. The
+  master key is unchanged (this is not key rotation), and a failure before the
+  commit leaves the legacy vault readable.
 - CLI password sources: `--password-file` and `--password-stdin`, with all
   password buffers zeroized. `--force` and an interactive confirmation guard
   destructive operations.
@@ -29,9 +34,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - The vault manifest schema is now version 3. Each entry records a non-empty
-  random ID; version 2 manifests (and version 3 manifests with a missing ID)
-  are rejected. Blobs are named from the ID, so entry paths are no longer
-  part of the on-disk layout or the AAD.
+  random ID; version 2 manifests now return `Error::MigrationRequired`
+  (version 3 manifests with a missing ID are still `InvalidVault`). Blobs are
+  named from the ID, so entry paths are no longer part of the on-disk layout
+  or the AAD.
 - `unlock` now takes a shared advisory lock, so it cannot read the config in
   the middle of a concurrent password change.
 - CI now runs doctests explicitly and gates advisories, licenses, and sources
@@ -47,9 +53,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrade note
 
-- Vaults written by 0.5.0 use manifest v2 and are rejected by 0.6.0.
-  A `keres migrate` command is required before the 0.6.0 tag; until then,
-  extract data with 0.5.0 before upgrading.
+- Vaults written by 0.5.0 use manifest v2 and are rejected by the 0.6.0
+  reader. Back up the vault directory, then run `keres migrate <vault>`
+  (or `Vault::migrate`). The password is unchanged and the legacy blobs are
+  removed after the v3 manifest is committed. Migration is one-way; keep the
+  backup until you have verified the upgraded vault.
 
 ## [0.5.0] - 2026-11-10
 

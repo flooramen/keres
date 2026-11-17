@@ -171,6 +171,14 @@ enum Commands {
         #[arg(long)]
         prune: bool,
     },
+    /// Upgrade a vault written by an older release (0.5.x) to the current format.
+    Migrate {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Migrate without an interactive confirmation.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Encrypt a single file.
     Encrypt {
         /// Path to the file to encrypt.
@@ -453,6 +461,29 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
                 let removed = v.prune_orphans()?;
                 println!("Pruned {removed} orphaned file(s)");
             }
+        }
+        Commands::Migrate { vault, force } => {
+            let dir = existing_vault_path(&vault)?;
+            if !force
+                && !confirm(&format!(
+                    "Migrate vault '{vault}' to the current format? Every entry is re-encrypted in place."
+                ))?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let password = passwords.read("Enter vault password")?;
+            let report = Vault::new(dir).migrate(password.as_str())?;
+            println!(
+                "Migrated {} {} ({} re-encrypted).",
+                report.entries,
+                if report.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                format_size(report.bytes)
+            );
         }
         Commands::Encrypt {
             input,
