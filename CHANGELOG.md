@@ -30,6 +30,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Vault::recover` / `keres recovery use` recreates a lost or corrupt
   `vault.config`, validates the key against the encrypted index, resets the
   password, and consumes the kit.
+- LUKS-style keyslots: `vault.config` v3 stores a table of independent
+  passphrase wrappings of the same master key. `Vault::add_keyslot` /
+  `Vault::remove_keyslot` and `keres keyslot add|remove|list` add or revoke a
+  passphrase; `change_password` re-wraps only the matching slot. Version 2
+  configs are read and upgraded on the next key-changing operation.
 - CLI password sources: `--password-file` and `--password-stdin`, with all
   password buffers zeroized. `--force` and an interactive confirmation guard
   destructive operations.
@@ -44,6 +49,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (version 3 manifests with a missing ID are still `InvalidVault`). Blobs are
   named from the ID, so entry paths are no longer part of the on-disk layout
   or the AAD.
+- `vault.config` is now version 3: a slot table instead of a single wrapped
+  key. Version 2 configs still unlock and are rewritten as version 3 on the
+  next key-changing operation. `Vault::change_password` now re-wraps only the
+  slot that matched and leaves a locked vault locked. `Vault::recover` writes
+  a fresh single-slot config, dropping any additional keyslots.
 - `unlock` now takes a shared advisory lock, so it cannot read the config in
   the middle of a concurrent password change.
 - CI now runs doctests explicitly and gates advisories, licenses, and sources
@@ -56,6 +66,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Adding a directory tree failed on Windows with `InvalidEntryName` because
   vault-relative names were built with the platform separator. Manifest names
   now always use `/`, independent of the host filesystem.
+- `change-password` no longer reuses a `--password-file` or `KERES_PASSWORD`
+  value for the new password. The new secret is prompted separately, so those
+  sources can be used without a terminal conflict.
 
 ### Upgrade note
 

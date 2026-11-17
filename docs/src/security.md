@@ -120,6 +120,26 @@ infeasible. The code must still be stored separately and handled like the
 vault itself. Creating a new kit replaces the old wrapping; losing both the
 code and the password remains unrecoverable.
 
+## Keyslots
+
+`vault.config` version 3 stores independent keyslots, each wrapping the same
+master key under its own Argon2id-derived KEK. Passphrases are never stored or
+compared to each other; unlocking derives a KEK per slot and succeeds when one
+AEAD tag verifies. Changing a password re-wraps one slot. Adding a slot does
+not alter ciphertext. Removing a slot drops that wrapping and revokes the
+passphrase.
+
+Revocation is not key rotation: the master key stays the same. An attacker who
+had already used the revoked passphrase to unwrap the master key keeps access
+to the ciphertext until the vault is deeply rotated or rebuilt. Revoking a
+keyslot is therefore a control for lost devices and role changes, not a
+remedy for a key that may have leaked. Deep rotation is tracked on the
+roadmap.
+
+Malformed slots fail closed with `InvalidVault`; a wrong passphrase across all
+slots is indistinguishable from a tampered wrapping (`Authentication`). Slot
+ids and the slot count are plaintext metadata in `vault.config`.
+
 ## Known Limitations
 
 1. **No memory locking** — with `forbid(unsafe_code)` we cannot call

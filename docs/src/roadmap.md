@@ -47,8 +47,10 @@ property will never be accepted for a compatibility or convenience win.
   recreates a lost config, validates the key against the index, and consumes
   the kit.)*
 - **Multiple keyslots (LUKS-style)** — several independent passphrases per
-  vault, each its own wrapped copy of the master key; individual slots can
-  be revoked. Depends on the config schema gaining a slot table.
+  vault, each its own wrapped copy of the master key; individual slots can be
+  revoked. *(Done. Config v3 stores a slot table; `Vault::add_keyslot` /
+  `remove_keyslot` and `keres keyslot add|remove|list`; v2 configs upgrade on
+  the next key change.)*
 - **Content re-encryption on password change (limitation 2)** — optional
   deep rotation: derive a fresh master key and stream every blob through
   re-encryption. Slow by design; opt-in only.

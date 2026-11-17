@@ -32,6 +32,9 @@ $ keres verify personal --prune
 $ keres migrate legacy-vault
 $ keres recovery create personal
 $ keres recovery use personal
+$ keres keyslot list personal
+$ keres keyslot add personal
+$ keres keyslot remove personal 0123456789abcdef
 $ keres change-password personal
 $ keres remove personal notes.txt
 ```
@@ -51,7 +54,10 @@ $ keres remove personal notes.txt
 | `migrate <vault> [--force]` | Upgrade a 0.5.x (manifest v2) vault to the current format |
 | `recovery create <vault> [--force]` | Create or replace the printable recovery kit |
 | `recovery use <vault>` | Reset the password with a recovery code (consumes the kit) |
-| `change-password <vault>` | Re-wrap the master key under a new password |
+| `keyslot list <vault>` | List keyslot ids (plaintext in `vault.config`) |
+| `keyslot add <vault>` | Add an additional passphrase for the same vault |
+| `keyslot remove <vault> <slot>` | Revoke a keyslot, authorized by a remaining passphrase |
+| `change-password <vault>` | Re-wrap one keyslot under a new password |
 | `encrypt <input> [output] [--force]` | Encrypt one file |
 | `decrypt <input> <output> [--force]` | Decrypt one file |
 
@@ -73,7 +79,17 @@ separately from the vault: either the vault directory or the code alone is
 not enough. `recovery use` prompts for the code, verifies it against the
 encrypted index, sets a new password, and deletes the kit so the code cannot
 be replayed. `recovery create --force` replaces an existing kit and
-invalidates its old code.
+invalidates its old code. Recovery writes a fresh single-slot config, so any
+additional keyslots must be re-added afterwards.
+
+`keyslot add` takes an existing passphrase plus a new one; both unlock the
+same master key and neither can decrypt stored data without the other. Use it
+for separate device or role passphrases. `keyslot remove` needs the id from
+`keyslot list` and a passphrase from a slot that will remain, so a mistyped
+target cannot delete your only credential. The last keyslot cannot be
+removed. Days later, `change-password` re-wraps only the slot you authenticate
+with; other passphrases keep working. Slot ids are stored in plaintext in
+`vault.config`.
 
 `verify --prune` deletes ciphertext blobs under `d/` that no manifest entry
 references (left behind by an interrupted add) and cleans up stale temp
@@ -100,8 +116,8 @@ an interactive prompt. Password values are held in zeroizing buffers and
 scrubbed when the command finishes. Prefer a terminal prompt or a
 permission-restricted password file on shared machines.
 
-`change-password` reads one password per prompt, so with
-`--password-stdin` it expects the current password, the new password, and the
-confirmation on three consecutive lines. With `--password-file` or
-`KERES_PASSWORD` every prompt gets the same value, which is rejected because
-the new password must differ from the current one.
+`change-password` reads the current password from the configured source, then
+prompts twice for the new password. With `--password-stdin` that means three
+consecutive lines (current, new, confirmation). With `--password-file` or
+`KERES_PASSWORD`, the new password is still entered interactively, or read
+from the next stdin lines when input is piped.

@@ -406,3 +406,119 @@ fn persistence_across_reopen() {
     v2.extract("persist.bin", &out).unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), big);
 }
+
+#[test]
+fn keyslots_add_change_and_revoke() {
+    let (_d, mut v) = make_vault("keyslots");
+    let src = v.path().parent().unwrap().join("f.txt");
+    std::fs::write(&src, b"data").unwrap();
+    v.add(&src, None).unwrap();
+
+    let original = v.keyslots().unwrap();
+    assert_eq!(original.len(), 1);
+    let original_id = original[0].id.clone();
+
+    // The authorizing passphrase must be real, and a duplicate slot is
+    // pointless.
+    assert!(matches!(
+        v.add_keyslot("WRONG", "second"),
+        Err(Error::Authentication)
+    ));
+    assert!(matches!(
+        v.add_keyslot("master-password", "master-password"),
+        Err(Error::Operation(_))
+    ));
+
+    let second = v.add_keyslot("master-password", "second-pass").unwrap();
+    let slots = v.keyslots().unwrap();
+    assert_eq!(slots.len(), 2);
+    assert!(slots.iter().any(|slot| slot.id == second.id));
+
+    v.lock();
+    let mut other = Vault::new(v.path().to_path_buf());
+    other.unlock("second-pass").unwrap();
+    assert_eq!(other.list().unwrap().len(), 1);
+    drop(other);
+
+    // Changing one slot leaves the other passphrase and the contents alone.
+    let mut with_second = Vault::new(v.path().to_path_buf());
+    with_second
+        .change_password("second-pass", "second-new")
+        .unwrap();
+    assert!(
+        !with_second.is_unlocked(),
+        "change_password must not unlock"
+    );
+    assert!(Vault::new(v.path().to_path_buf())
+        .unlock("second-pass")
+        .is_err());
+    assert!(Vault::new(v.path().to_path_buf())
+        .unlock("second-new")
+        .is_ok());
+    assert!(Vault::new(v.path().to_path_buf())
+        .unlock("master-password")
+        .is_ok());
+
+    // Revoking with the target's own passphrase is refused: the authorizing
+    // slot must survive.
+    let mut revoker = Vault::new(v.path().to_path_buf());
+    assert!(matches!(
+        revoker.remove_keyslot(&second.id, "second-new"),
+        Err(Error::Operation(_))
+    ));
+
+    revoker
+        .remove_keyslot(&second.id, "master-password")
+        .unwrap();
+    assert!(Vault::new(v.path().to_path_buf())
+        .unlock("second-new")
+        .is_err());
+
+    let mut remaining = Vault::new(v.path().to_path_buf());
+    remaining.unlock("master-password").unwrap();
+    assert_eq!(remaining.list().unwrap().len(), 1);
+    assert_eq!(remaining.keyslots().unwrap()[0].id, original_id);
+}
+
+#[test]
+fn keyslot_removal_cannot_brick_the_vault() {
+    let (_d, mut v) = make_vault("slotlast");
+    let original_id = v.keyslots().unwrap()[0].id.clone();
+
+    // A single slot cannot be removed: no other passphrase can authorize it.
+    assert!(matches!(
+        v.remove_keyslot(&original_id, "master-password"),
+        Err(Error::Operation(_))
+    ));
+
+    let second = v.add_keyslot("master-password", "second").unwrap();
+    v.remove_keyslot(&second.id, "master-password").unwrap();
+
+    let slots = v.keyslots().unwrap();
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].id, original_id);
+    assert!(matches!(
+        v.remove_keyslot(&original_id, "master-password"),
+        Err(Error::Operation(_))
+    ));
+}
+
+#[test]
+fn recovery_resets_to_a_single_keyslot() {
+    let (_d, mut v) = make_vault("slotrecover");
+    v.add_keyslot("master-password", "second").unwrap();
+    let code = v.create_recovery_kit("master-password").unwrap();
+    let dir = v.path().to_path_buf();
+    drop(v);
+
+    std::fs::remove_file(dir.join("vault.config")).unwrap();
+    let mut recovered = Vault::new(dir.clone());
+    recovered.recover(code.expose(), "after-recovery").unwrap();
+
+    // Recovery normalizes the config to one fresh slot; extra passphrases are
+    // gone and must be re-added deliberately.
+    assert_eq!(recovered.keyslots().unwrap().len(), 1);
+    assert!(Vault::new(dir.clone()).unlock("master-password").is_err());
+    assert!(Vault::new(dir.clone()).unlock("second").is_err());
+    assert!(Vault::new(dir).unlock("after-recovery").is_ok());
+}

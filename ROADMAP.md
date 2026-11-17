@@ -30,7 +30,9 @@ matters most for the monorepo.
 - [ ] Entry metadata (mtime, mode) and `list --recursive` / `stat`.
 - [x] Printable recovery kit (`keres recovery create` / `recovery use`,
       `Vault::create_recovery_kit` / `Vault::recover`).
-- [ ] Multi-recipient keys (X25519) and LUKS-style key slots.
+- [x] LUKS-style keyslots (`Vault::add_keyslot` / `remove_keyslot`,
+      `keres keyslot add|remove|list`; config v3 slot table).
+- [ ] Multi-recipient keys (X25519).
 - [x] Orphan garbage collection (`verify --prune`).
 - [ ] Parallel chunk pipeline.
 

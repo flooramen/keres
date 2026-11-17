@@ -184,6 +184,11 @@ enum Commands {
         #[command(subcommand)]
         action: RecoveryCommands,
     },
+    /// Manage vault passphrases (keyslots).
+    Keyslot {
+        #[command(subcommand)]
+        action: KeyslotCommands,
+    },
     /// Encrypt a single file.
     Encrypt {
         /// Path to the file to encrypt.
@@ -220,6 +225,27 @@ enum RecoveryCommands {
     Use {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
         vault: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyslotCommands {
+    /// List keyslot ids (stored in plaintext in vault.config).
+    List {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+    },
+    /// Add an additional passphrase that unlocks the same vault.
+    Add {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+    },
+    /// Revoke a keyslot, authorized by a passphrase that will remain.
+    Remove {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Keyslot id from `keres keyslot list`.
+        slot: String,
     },
 }
 
@@ -294,6 +320,23 @@ fn read_recovery_code() -> Result<Zeroizing<String>> {
         return Err(Error::Operation("recovery code must not be empty".into()));
     }
     Ok(code)
+}
+
+/// Reads a new secret twice and checks the entries match.
+///
+/// The first password source may be a file or `KERES_PASSWORD`, so the new
+/// secret is always prompted (or read from the next stdin lines when input is
+/// piped) rather than reusing that source.
+fn read_new_password(prompt: &str) -> Result<Zeroizing<String>> {
+    let first = prompt_interactive(prompt)?;
+    let second = prompt_interactive("Confirm new password")?;
+    if first.as_str() != second.as_str() {
+        return Err(Error::Operation("new passwords don't match".into()));
+    }
+    if first.is_empty() {
+        return Err(Error::Operation("password must not be empty".into()));
+    }
+    Ok(first)
 }
 
 /// Asks for a yes/no answer. Returns an error when there is no terminal to
@@ -464,11 +507,7 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
         Commands::ChangePassword { vault } => {
             let dir = existing_vault_path(&vault)?;
             let old = passwords.read("Current password")?;
-            let new = passwords.read("New password")?;
-            let confirm = passwords.read("Confirm new password")?;
-            if new.as_str() != confirm.as_str() {
-                return Err(Error::Operation("new passwords don't match".into()));
-            }
+            let new = read_new_password("New password")?;
             if new.as_str() == old.as_str() {
                 return Err(Error::Operation(
                     "new password must differ from the current password".into(),
@@ -477,6 +516,43 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
             Vault::new(dir).change_password(old.as_str(), new.as_str())?;
             println!("Password changed successfully!");
         }
+        Commands::Keyslot { action } => match action {
+            KeyslotCommands::List { vault } => {
+                let dir = existing_vault_path(&vault)?;
+                let slots = Vault::new(dir).keyslots()?;
+                println!("{:<20} NOTE", "SLOT");
+                println!("{}", "-".repeat(60));
+                for slot in slots {
+                    let note = if slot.id == "legacy" {
+                        "legacy config; converted on the next key change"
+                    } else {
+                        ""
+                    };
+                    println!("{:<20} {}", slot.id, note);
+                }
+            }
+            KeyslotCommands::Add { vault } => {
+                let dir = existing_vault_path(&vault)?;
+                let current = passwords.read("Current vault password")?;
+                let new = read_new_password("New passphrase")?;
+                if new.as_str() == current.as_str() {
+                    return Err(Error::Operation(
+                        "new passphrase must differ from the current passphrase".into(),
+                    ));
+                }
+                let slot = Vault::new(dir).add_keyslot(current.as_str(), new.as_str())?;
+                println!("Added keyslot {}.", slot.id);
+                println!(
+                    "Store the new passphrase separately; any keyslot unlocks the same vault."
+                );
+            }
+            KeyslotCommands::Remove { vault, slot } => {
+                let dir = existing_vault_path(&vault)?;
+                let password = passwords.read("Password for a keyslot that will remain")?;
+                Vault::new(dir).remove_keyslot(&slot, password.as_str())?;
+                println!("Removed keyslot {slot}.");
+            }
+        },
         Commands::Verify { vault, prune } => {
             let dir = existing_vault_path(&vault)?;
             let password = passwords.read("Enter vault password")?;

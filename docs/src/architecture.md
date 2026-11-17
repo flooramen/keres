@@ -250,21 +250,38 @@ risking a stale manifest. The lock is released when the operation returns.
 ### vault.config (bootstrap)
 
 A small JSON document — *not* a container, because it must be parseable
-before any key exists:
+before any key exists. Version 3 holds a table of independent keyslots, each
+wrapping the *same* master key under its own password-derived KEK:
 
 ```json
 {
-  "version": 2,
-  "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
-  "salt": [..32 bytes..],
-  "wrapped_master_key": [..master ‖ GCM tag..]
+  "version": 3,
+  "slots": [
+    {
+      "id": "0123456789abcdef",
+      "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
+      "salt": [..32 bytes..],
+      "nonce": [..12 bytes..],
+      "wrapped_master_key": [..master ‖ GCM tag..]
+    }
+  ]
 }
 ```
 
-The master key is generated once at `init`, encrypted under the KEK with
-AAD `"keres-vault-config-v2"` and the fixed config nonce (safe: unique
-KEK, single short message). Wrong password and tampered config are
-indistinguishable (`Authentication`) by design.
+The master key is generated once at `init`. Each slot has a fresh random
+salt, a random 96-bit nonce, and AAD `"keres-vault-config-v3/" + slot_id`, so
+wrapped keys cannot be transplanted between slots undetected. Unlocking tries
+each slot; `change_password` re-wraps only the slot that matched;
+`add_keyslot` appends a slot; `remove_keyslot` deletes one and must be
+authorized by a passphrase from a slot that remains. Slot ids are plaintext,
+like the rest of the bootstrap structure. Wrong password and tampered
+config are indistinguishable (`Authentication`) by design; a structurally
+malformed slot is `InvalidVault`.
+
+Version 2 configs (the 0.5.x single implicit slot, fixed nonce, AAD
+`"keres-vault-config-v2"`) are still read and are rewritten as version 3 the
+next time a key operation changes the config. No password changes during that
+upgrade.
 
 ### vault.recovery (recovery kit)
 
@@ -286,9 +303,10 @@ of four Crockford Base32 symbols with a 16-bit checksum. The code is never
 stored. The file is not a container because it must be parsed before any key
 exists; AEAD with a random nonce and AAD `"keres-vault-recovery-v1"`
 authenticates it. `Vault::recover` validates the unwrapped master against the
-encrypted index, re-wraps `vault.config` under a new password, and consumes
-the kit. Losing `vault.config` no longer bricks the vault; losing the code
-still does.
+encrypted index, re-wraps `vault.config` as a fresh single-slot config, and
+consumes the kit. Losing `vault.config` no longer bricks the vault; losing
+the code still does. Any extra keyslots are lost in recovery and must be
+re-added.
 
 ### Blob locations
 
@@ -339,7 +357,10 @@ rewritten wholesale (temp+rename), never mutated in place.
 | `list()` | reads manifest only — no blobs touched, fast |
 | `extract(name, dest)` | recreates hierarchy; names sanitized; outputs via temp+rename |
 | `remove(name)` | removes subtree: blobs *and* manifest records (no orphans from successful ops) |
-| `change_password(old,new)` | verifies old, re-wraps same master; ciphertext untouched |
+| `change_password(old,new)` | verifies old, re-wraps only that keyslot; ciphertext and other slots untouched |
+| `keyslots()` | lists plaintext slot ids; no password required |
+| `add_keyslot(existing,new)` | verifies an existing passphrase and appends an independent slot; upgrades a legacy config |
+| `remove_keyslot(id,pw)` | revokes a slot, authorized by a passphrase from a slot that remains; the last slot is refused |
 | `verify(pw)` | decrypts every blob (type-checked), cross-checks manifest presence; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
 | `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no manifest record references; refuses if the manifest is missing |
 | `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the manifest atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |

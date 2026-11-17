@@ -41,6 +41,7 @@ pub(crate) mod manifest;
 pub(crate) mod migrate;
 pub(crate) mod recovery;
 
+pub use keystore::KeyslotInfo;
 pub use migrate::MigrationReport;
 pub use recovery::RecoveryCode;
 
@@ -157,6 +158,12 @@ impl Vault {
         VaultConfig::parse(&json)
     }
 
+    /// Serializes and atomically replaces `vault.config`.
+    fn write_config(&self, config: &VaultConfig) -> Result<()> {
+        let json = serde_json::to_string_pretty(config).map_err(|_| Error::InvalidVault)?;
+        crate::fsutil::atomic_write(&self.config_path(), json.as_bytes())
+    }
+
     /// Initializes a new vault protected by `password`.
     ///
     /// Fails if the vault already exists. Created directories get owner-only
@@ -183,9 +190,7 @@ impl Vault {
         }
 
         let config = self.keystore.init(password)?;
-
-        let json = serde_json::to_string_pretty(&config).map_err(|_| Error::InvalidVault)?;
-        crate::fsutil::atomic_write(&self.config_path(), json.as_bytes())?;
+        self.write_config(&config)?;
 
         manifest::save(&self.path, &ManifestMap::new(), self.keystore.master_key()?)?;
         Ok(())
@@ -564,7 +569,8 @@ impl Vault {
     /// is verified against the existing index before anything is written; on
     /// success the config is re-wrapped under `new_password` and the recovery
     /// kit is consumed (deleted) so the code cannot be replayed. The vault is
-    /// left locked.
+    /// left locked. Recovery writes a fresh single-slot config: any additional
+    /// keyslots are lost and must be re-added.
     ///
     /// ```no_run
     /// use keres::Vault;
@@ -593,18 +599,104 @@ impl Vault {
             }
         }
 
-        let config = keystore::wrap_for_password(&master, new_password)?;
-        let json = serde_json::to_string_pretty(&config).map_err(|_| Error::InvalidVault)?;
-        crate::fsutil::atomic_write(&self.config_path(), json.as_bytes())?;
+        let config = VaultConfig::new(&master, new_password)?;
+        self.write_config(&config)?;
         recovery::remove(&self.path)?;
         self.keystore.lock();
         Ok(())
     }
 
-    /// Changes the vault password after verifying `old_password`.
+    /// Lists the vault's keyslots.
     ///
-    /// Only the wrapped master key is re-encrypted; stored data is untouched.
-    /// Works regardless of lock state and leaves the lock state unchanged.
+    /// Slot ids and count are stored in plaintext in `vault.config`, so this
+    /// needs no password. Secret material is never exposed.
+    ///
+    /// ```no_run
+    /// let vault = keres::Vault::new("secrets".into());
+    /// for slot in vault.keyslots()? {
+    ///     println!("{}", slot.id);
+    /// }
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn keyslots(&self) -> Result<Vec<KeyslotInfo>> {
+        if !self.exists() {
+            return Err(Error::VaultNotFound);
+        }
+        let _lock = VaultLock::shared(&self.path)?;
+        Ok(self.load_config()?.slot_ids())
+    }
+
+    /// Adds a keyslot: a new passphrase that unlocks the same master key.
+    ///
+    /// `existing_password` must unlock the vault (any slot works) and
+    /// `new_password` becomes an independent slot. The master key and stored
+    /// data are unchanged. A legacy single-password config is upgraded to the
+    /// current slot format without changing the existing passphrase.
+    ///
+    /// ```no_run
+    /// let mut vault = keres::Vault::new("secrets".into());
+    /// let slot = vault.add_keyslot("current pass", "laptop pass")?;
+    /// println!("added keyslot {}", slot.id);
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn add_keyslot(
+        &mut self,
+        existing_password: &str,
+        new_password: &str,
+    ) -> Result<KeyslotInfo> {
+        if !self.exists() {
+            return Err(Error::VaultNotFound);
+        }
+        if existing_password == new_password {
+            return Err(Error::Operation(
+                "new passphrase must differ from the authorizing passphrase".into(),
+            ));
+        }
+        let _lock = VaultLock::exclusive(&self.path)?;
+        let config = self.load_config()?;
+        let (master, _) = config.unlock(existing_password)?;
+        let (new_config, info) = config.add_slot(&master, existing_password, new_password)?;
+        self.write_config(&new_config)?;
+        Ok(info)
+    }
+
+    /// Removes a keyslot, revoking its passphrase.
+    ///
+    /// `password` must unlock a slot that will remain, so a typo can never
+    /// delete the only working credential. The last keyslot cannot be removed.
+    /// Stored data is untouched.
+    ///
+    /// ```no_run
+    /// let mut vault = keres::Vault::new("secrets".into());
+    /// vault.remove_keyslot("0123456789abcdef", "remaining pass")?;
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn remove_keyslot(&mut self, slot_id: &str, password: &str) -> Result<()> {
+        if !self.exists() {
+            return Err(Error::VaultNotFound);
+        }
+        let _lock = VaultLock::exclusive(&self.path)?;
+        let config = self.load_config()?;
+        let (_, authorizing) = config.unlock(password)?;
+        let target = config
+            .slot_index(slot_id)
+            .ok_or_else(|| Error::Operation(format!("no keyslot with id {slot_id:?}")))?;
+        if target == authorizing {
+            return Err(Error::Operation(
+                "authorize removal with a passphrase from a keyslot that will remain".into(),
+            ));
+        }
+        let new_config = config.remove_slot(target)?;
+        self.write_config(&new_config)?;
+        Ok(())
+    }
+
+    /// Changes the password of the keyslot that `old_password` unlocks.
+    ///
+    /// Only that slot's wrapped copy of the master key is re-encrypted; other
+    /// keyslots and all stored data are untouched. A legacy config is rewritten
+    /// in the current slot format. Works regardless of lock state and leaves
+    /// the lock state unchanged.
     ///
     /// ```no_run
     /// let mut vault = keres::Vault::new("secrets".into());
@@ -617,17 +709,9 @@ impl Vault {
         }
         let _lock = VaultLock::exclusive(&self.path)?;
         let config = self.load_config()?;
-        // Prove knowledge of the old password even if the vault was already
-        // unlocked.
-        config.unwrap_master_key(old_password)?;
-
-        if !self.keystore.is_unlocked() {
-            self.unlock_inner(old_password)?;
-        }
-
-        let new_config = self.keystore.rotate_password(new_password)?;
-        let json = serde_json::to_string_pretty(&new_config).map_err(|_| Error::InvalidVault)?;
-        crate::fsutil::atomic_write(&self.config_path(), json.as_bytes())?;
+        let (master, index) = config.unlock(old_password)?;
+        let new_config = config.rewrap_slot(index, &master, new_password)?;
+        self.write_config(&new_config)?;
         Ok(())
     }
 

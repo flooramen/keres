@@ -117,12 +117,14 @@ pub mod prelude {
     pub use crate::crypto::Key;
     pub use crate::error::{Error, Result};
     pub use crate::single_file::{decrypt_file, encrypt_file};
-    pub use crate::vault::{EntryInfo, IntegrityReport, MigrationReport, RecoveryCode, Vault};
+    pub use crate::vault::{
+        EntryInfo, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, Vault,
+    };
 }
 
 pub use error::{Error, Result};
 pub use single_file::{decrypt_file, encrypt_file};
-pub use vault::{EntryInfo, IntegrityReport, MigrationReport, RecoveryCode, Vault};
+pub use vault::{EntryInfo, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, Vault};
 
 /// Crate version, handy for CLI `--version` output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
