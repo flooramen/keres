@@ -235,9 +235,11 @@ A vault is a directory:
 myvault/
 ├── vault.config          bootstrap JSON (plaintext structure, sealed value)
 ├── vault.recovery        optional second wrapping of the master key
+├── vault.rotate          transient deep-rotation journal (present only mid-run)
 ├── vault.lock            advisory inter-process lock (empty)
 └── d/
     ├── .manifest.enc     the index, as a kind-0 container
+    ├── .manifest.enc.next  staged manifest during rotation (transient)
     └── <h2>/<h48>.enc    one blob per entry, as kind-0 containers
 ```
 
@@ -308,6 +310,36 @@ consumes the kit. Losing `vault.config` no longer bricks the vault; losing
 the code still does. Any extra keyslots are lost in recovery and must be
 re-added.
 
+### vault.rotate (rotation journal)
+
+`Vault::rotate` / `keres rotate` performs an opt-in **deep rotation**: it
+generates a fresh master key, streams every blob through re-encryption, and
+rewrites the index under the new key. The new config has exactly one keyslot
+under the new password; other keyslots and the recovery kit wrapped the old
+master key and are discarded.
+
+Rotation writes `d/.manifest.enc.next`, then a small `vault.rotate` journal
+containing the new config (already wrapped) and the SHA-256 of the staged
+manifest — never a plaintext key:
+
+```json
+{"version": 1, "manifest_sha256": "..64 hex..", "config": "{..v3 config..}"}
+```
+
+The journal write is the commit point. After it, the staged manifest is
+renamed over `.manifest.enc`, the config is replaced, the old recovery kit is
+removed, and the journal is deleted. If the process dies after the journal
+but before completion, the next operation that opens the vault finishes the
+swap: it compares the journal hash against the canonical and staged
+manifests, promotes the staged one when it matches, and installs the config.
+If neither manifest matches, the rotation is rolled back and the journal is
+discarded. Before the journal exists, the old vault is untouched and the
+staged blobs are ordinary orphans for `prune_orphans`.
+
+Old blobs are unreachable under the new master; rotation removes them
+best-effort after the swap, and any leftovers are reclaimed by
+`verify --prune`.
+
 ### Blob locations
 
 ```
@@ -358,6 +390,7 @@ rewritten wholesale (temp+rename), never mutated in place.
 | `extract(name, dest)` | recreates hierarchy; names sanitized; outputs via temp+rename |
 | `remove(name)` | removes subtree: blobs *and* manifest records (no orphans from successful ops) |
 | `change_password(old,new)` | verifies old, re-wraps only that keyslot; ciphertext and other slots untouched |
+| `rotate(old,new)` | deep rotation: fresh master key, all blobs re-encrypted, index rewritten; collapses to one keyslot, removes the recovery kit, leaves the vault locked; crash-safe via `vault.rotate` |
 | `keyslots()` | lists plaintext slot ids; no password required |
 | `add_keyslot(existing,new)` | verifies an existing passphrase and appends an independent slot; upgrades a legacy config |
 | `remove_keyslot(id,pw)` | revokes a slot, authorized by a passphrase from a slot that remains; the last slot is refused |
@@ -393,6 +426,9 @@ Invariants: a crash may lose the *current* operation, never corrupt
   states.
 - Failure mid-add leaves unreferenced blobs (manifest unchanged) — visible
   to nobody, and reclaimed by `verify --prune` / `Vault::prune_orphans`.
+- Deep rotation commits through `vault.rotate` before touching the canonical
+  manifest, so an interrupted run is either rolled back or completed on the
+  next open. A staged `.manifest.enc.next` without a journal is ignored.
 
 ---
 

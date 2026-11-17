@@ -57,7 +57,7 @@ struct ManifestFile {
     files: ManifestMap,
 }
 
-fn manifest_path(vault_dir: &Path) -> std::path::PathBuf {
+pub(crate) fn path(vault_dir: &Path) -> std::path::PathBuf {
     vault_dir.join("d").join(".manifest.enc")
 }
 
@@ -76,7 +76,7 @@ pub(crate) enum ManifestContents {
 /// truncated or unauthentic is an error — silently treating corruption as
 /// "no entries" would let the next save drop every existing record.
 pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
-    let path = manifest_path(vault_dir);
+    let path = path(vault_dir);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ManifestMap::new()),
@@ -105,7 +105,7 @@ pub(crate) fn decode(bytes: &[u8], master: &Key) -> Result<ManifestMap> {
 /// Unlike [`load`], a missing manifest is an error: migration must never
 /// mistake an empty data directory for a complete legacy index.
 pub(crate) fn load_legacy_v2(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
-    let path = manifest_path(vault_dir);
+    let path = path(vault_dir);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::InvalidVault),
@@ -163,6 +163,15 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
 /// Atomically saves the manifest as a fresh container (new object salt on
 /// every write).
 pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Result<()> {
+    let blob = encode(files, master)?;
+    crate::fsutil::atomic_write(&path(vault_dir), &blob)
+}
+
+/// Encodes the manifest as a fresh container under `master`.
+///
+/// Deep rotation writes the encoded bytes to a staging path before swapping
+/// them in, so the same encoder is shared with [`save`].
+pub(crate) fn encode(files: &ManifestMap, master: &Key) -> Result<Vec<u8>> {
     let manifest = ManifestFile {
         version: MANIFEST_VERSION,
         files: files.clone(),
@@ -186,5 +195,5 @@ pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Resul
         None,
     )?;
 
-    crate::fsutil::atomic_write(&manifest_path(vault_dir), &blob)
+    Ok(blob)
 }

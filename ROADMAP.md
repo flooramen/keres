@@ -32,6 +32,9 @@ matters most for the monorepo.
       `Vault::create_recovery_kit` / `Vault::recover`).
 - [x] LUKS-style keyslots (`Vault::add_keyslot` / `remove_keyslot`,
       `keres keyslot add|remove|list`; config v3 slot table).
+- [x] Opt-in deep rotation (`Vault::rotate` / `keres rotate`): fresh master
+      key, every entry re-encrypted, journal-based crash recovery; collapses
+      to one keyslot and removes the recovery kit.
 - [ ] Multi-recipient keys (X25519).
 - [x] Orphan garbage collection (`verify --prune`).
 - [ ] Parallel chunk pipeline.

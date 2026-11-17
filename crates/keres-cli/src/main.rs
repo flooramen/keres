@@ -163,6 +163,18 @@ enum Commands {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
         vault: String,
     },
+    /// Re-encrypt every entry under a fresh master key (deep rotation).
+    ///
+    /// Unlike change-password, this changes the data key itself. All other
+    /// keyslots and any recovery kit are invalidated, and the vault ends up
+    /// locked under the new password.
+    Rotate {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Rotate without an interactive confirmation.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Verify the integrity of all vault entries (full authentication).
     Verify {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
@@ -515,6 +527,74 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
             }
             Vault::new(dir).change_password(old.as_str(), new.as_str())?;
             println!("Password changed successfully!");
+        }
+        Commands::Rotate { vault, force } => {
+            let dir = existing_vault_path(&vault)?;
+            let v = Vault::new(dir.clone());
+            let slots = v.keyslots()?.len();
+            let has_kit = v.has_recovery_kit();
+            let extra: Vec<String> = [
+                (slots.saturating_sub(1) > 0).then(|| {
+                    format!(
+                        "{} other keyslot{} will be revoked",
+                        slots - 1,
+                        if slots == 2 { "" } else { "s" }
+                    )
+                }),
+                has_kit.then(|| "the recovery kit will be deleted".to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let consequences = if extra.is_empty() {
+                String::new()
+            } else {
+                format!(" {};", extra.join(" and "))
+            };
+            if !force
+                && !confirm(&format!(
+                    "Rotate vault '{vault}'? Every entry is re-encrypted under a fresh master key;{} the vault is left locked under the new password.",
+                    consequences
+                ))?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let old = passwords.read("Current password")?;
+            let new = read_new_password("New password")?;
+            if new.as_str() == old.as_str() {
+                return Err(Error::Operation(
+                    "new password must differ from the current password".into(),
+                ));
+            }
+            let report = Vault::new(dir).rotate(old.as_str(), new.as_str())?;
+            println!(
+                "Rotated: re-encrypted {} {} ({}).",
+                report.entries,
+                if report.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                format_size(report.bytes)
+            );
+            if report.discarded_keyslots > 0 {
+                println!(
+                    "Revoked {} other keyslot{}.",
+                    report.discarded_keyslots,
+                    if report.discarded_keyslots == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
+            }
+            if report.recovery_kit_removed {
+                println!(
+                    "Removed the old recovery kit; create a new one with `keres recovery create`."
+                );
+            }
+            println!("The vault is locked; unlock it with the new password.");
         }
         Commands::Keyslot { action } => match action {
             KeyslotCommands::List { vault } => {

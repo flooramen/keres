@@ -40,10 +40,12 @@ pub(crate) mod lock;
 pub(crate) mod manifest;
 pub(crate) mod migrate;
 pub(crate) mod recovery;
+pub(crate) mod rotation;
 
 pub use keystore::KeyslotInfo;
 pub use migrate::MigrationReport;
 pub use recovery::RecoveryCode;
+pub use rotation::RotationReport;
 
 use file_ops as blobs;
 use keystore::{KeyStore, VaultConfig};
@@ -204,8 +206,14 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        // A shared lock keeps `unlock` from reading the config in the middle
-        // of a concurrent `change_password` (which holds the exclusive lock).
+        // A committed rotation must be finished before the config is read.
+        // That path needs the exclusive lock; otherwise a shared lock still
+        // keeps `unlock` from racing a concurrent password change.
+        if rotation::pending(&self.path) {
+            let _lock = VaultLock::exclusive(&self.path)?;
+            rotation::recover(&self.path)?;
+            return self.unlock_inner(password);
+        }
         let _lock = VaultLock::shared(&self.path)?;
         self.unlock_inner(password)
     }
@@ -524,6 +532,7 @@ impl Vault {
             return Err(Error::VaultNotFound);
         }
         let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
         let config = self.load_config()?;
         let master = config.unwrap_master_key(password)?;
         migrate::run(&self.path, &master)
@@ -552,6 +561,7 @@ impl Vault {
             return Err(Error::VaultNotFound);
         }
         let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
         let config = self.load_config()?;
         let master = config.unwrap_master_key(password)?;
         recovery::create(&self.path, &master)
@@ -585,6 +595,7 @@ impl Vault {
             return Err(Error::VaultNotFound);
         }
         let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
         let master = recovery::unlock(&self.path, recovery_code)?;
 
         // Refuse to overwrite the config with a key that cannot read this
@@ -622,6 +633,11 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
+        if rotation::pending(&self.path) {
+            let _lock = VaultLock::exclusive(&self.path)?;
+            rotation::recover(&self.path)?;
+            return Ok(self.load_config()?.slot_ids());
+        }
         let _lock = VaultLock::shared(&self.path)?;
         Ok(self.load_config()?.slot_ids())
     }
@@ -653,6 +669,7 @@ impl Vault {
             ));
         }
         let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
         let config = self.load_config()?;
         let (master, _) = config.unlock(existing_password)?;
         let (new_config, info) = config.add_slot(&master, existing_password, new_password)?;
@@ -676,6 +693,7 @@ impl Vault {
             return Err(Error::VaultNotFound);
         }
         let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
         let config = self.load_config()?;
         let (_, authorizing) = config.unlock(password)?;
         let target = config
@@ -708,11 +726,60 @@ impl Vault {
             return Err(Error::VaultNotFound);
         }
         let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
         let config = self.load_config()?;
         let (master, index) = config.unlock(old_password)?;
         let new_config = config.rewrap_slot(index, &master, new_password)?;
         self.write_config(&new_config)?;
         Ok(())
+    }
+
+    /// Re-encrypts every entry under a fresh master key (deep rotation).
+    ///
+    /// Unlike [`Vault::change_password`], this changes the data key itself:
+    /// every blob is streamed through re-encryption and the manifest is
+    /// rewritten under the new master. The vault ends up locked.
+    ///
+    /// The new config has exactly one keyslot under `new_password`. Every
+    /// other keyslot wraps the old master and cannot survive, so those
+    /// passphrases stop working. Any recovery kit is also removed (create a
+    /// new one afterwards). The returned [`RotationReport`] records how many
+    /// keyslots and bytes were affected.
+    ///
+    /// Rotation is crash-safe: a journal written before the manifest swap lets
+    /// the next unlock finish an interrupted run. If the process dies before
+    /// the journal is committed, the old vault is untouched and staged blobs
+    /// are reclaimable with [`Vault::prune_orphans`].
+    ///
+    /// ```no_run
+    /// let mut vault = keres::Vault::new("secrets".into());
+    /// let report = vault.rotate("old pass", "new pass")?;
+    /// println!("re-encrypted {} entries", report.entries);
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn rotate(&mut self, old_password: &str, new_password: &str) -> Result<RotationReport> {
+        if !self.exists() {
+            return Err(Error::VaultNotFound);
+        }
+        let _lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
+        let config = self.load_config()?;
+        let (old_master, _) = config.unlock(old_password)?;
+        let discarded_keyslots = config.slot_ids().len().saturating_sub(1);
+
+        let new_master = Key::generate();
+        let new_config = VaultConfig::new(&new_master, new_password)?;
+        let report = rotation::run(
+            &self.path,
+            &old_master,
+            &new_master,
+            &new_config,
+            discarded_keyslots,
+        )?;
+
+        // The in-memory key is stale by construction.
+        self.keystore.lock();
+        Ok(report)
     }
 
     /// Verifies every entry's blob by fully decrypting it (authenticating
@@ -734,7 +801,17 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
+        if rotation::pending(&self.path) {
+            let _lock = VaultLock::exclusive(&self.path)?;
+            rotation::recover(&self.path)?;
+            return self.verify_with_lock(password);
+        }
         let _lock = VaultLock::shared(&self.path)?;
+        self.verify_with_lock(password)
+    }
+
+    /// Verifies with the caller already holding a vault lock.
+    fn verify_with_lock(&mut self, password: &str) -> Result<IntegrityReport> {
         let was_unlocked = self.is_unlocked();
         if !was_unlocked {
             self.unlock_inner(password)?;

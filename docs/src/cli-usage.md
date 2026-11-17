@@ -36,6 +36,7 @@ $ keres keyslot list personal
 $ keres keyslot add personal
 $ keres keyslot remove personal 0123456789abcdef
 $ keres change-password personal
+$ keres rotate personal --force
 $ keres remove personal notes.txt
 ```
 
@@ -58,6 +59,7 @@ $ keres remove personal notes.txt
 | `keyslot add <vault>` | Add an additional passphrase for the same vault |
 | `keyslot remove <vault> <slot>` | Revoke a keyslot, authorized by a remaining passphrase |
 | `change-password <vault>` | Re-wrap one keyslot under a new password |
+| `rotate <vault> [--force]` | Deep rotation: re-encrypt everything under a fresh master key, collapsing to one keyslot |
 | `encrypt <input> [output] [--force]` | Encrypt one file |
 | `decrypt <input> <output> [--force]` | Decrypt one file |
 
@@ -91,6 +93,15 @@ removed. Days later, `change-password` re-wraps only the slot you authenticate
 with; other passphrases keep working. Slot ids are stored in plaintext in
 `vault.config`.
 
+`rotate` is the destructive, slow alternative to `change-password`: it
+generates a fresh master key, re-encrypts every entry, and rewrites the index.
+It keeps exactly one keyslot, under the new password, so all other passphrases
+stop working; an existing recovery kit is removed as well and must be
+re-created afterwards. The command asks for confirmation (or needs
+`--force`) and leaves the vault locked. A journal makes an interrupted run
+recoverable on the next open: it either completes the rotation or rolls back
+to the untouched old vault.
+
 `verify --prune` deletes ciphertext blobs under `d/` that no manifest entry
 references (left behind by an interrupted add) and cleans up stale temp
 files. It only prunes after a successful integrity check and refuses to run
@@ -116,8 +127,8 @@ an interactive prompt. Password values are held in zeroizing buffers and
 scrubbed when the command finishes. Prefer a terminal prompt or a
 permission-restricted password file on shared machines.
 
-`change-password` reads the current password from the configured source, then
-prompts twice for the new password. With `--password-stdin` that means three
-consecutive lines (current, new, confirmation). With `--password-file` or
-`KERES_PASSWORD`, the new password is still entered interactively, or read
-from the next stdin lines when input is piped.
+`change-password` and `rotate` read the current password from the configured
+source, then prompt twice for the new password. With `--password-stdin` that
+means three consecutive lines (current, new, confirmation). With
+`--password-file` or `KERES_PASSWORD`, the new password is still entered
+interactively, or read from the next stdin lines when input is piped.

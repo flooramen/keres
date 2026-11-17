@@ -53,7 +53,9 @@ property will never be accepted for a compatibility or convenience win.
   the next key change.)*
 - **Content re-encryption on password change (limitation 2)** — optional
   deep rotation: derive a fresh master key and stream every blob through
-  re-encryption. Slow by design; opt-in only.
+  re-encryption. *(Done. `Vault::rotate` / `keres rotate`; crash-safe via
+  the `vault.rotate` journal, collapses to one keyslot and removes the
+  recovery kit.)*
 - **Parallel chunk pipeline** — encrypt/decrypt chunks across threads
   (counter nonces and AAD already make chunks independent). Target:
   saturate AES-NI (~3–5 GB/s) instead of today's ~400 MB/s single-thread.

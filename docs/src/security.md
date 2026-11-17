@@ -48,9 +48,10 @@ password ─Argon2id─► KEK ─wrap─► master key (vault.config)
                                     └─► HKDF manifest key
 ```
 
-`change_password` re-wraps only the master key; no re-encryption of data.
-Password rotation does not invalidate old ciphertext copies an attacker may
-have previously exfiltrated.
+`change_password` re-wraps only the matching keyslot; no re-encryption of data.
+`rotate` generates a new master key and re-encrypts the current entries, but no
+rotation can invalidate ciphertext copies an attacker has already
+exfiltrated.
 
 ## Memory Handling
 
@@ -133,8 +134,10 @@ Revocation is not key rotation: the master key stays the same. An attacker who
 had already used the revoked passphrase to unwrap the master key keeps access
 to the ciphertext until the vault is deeply rotated or rebuilt. Revoking a
 keyslot is therefore a control for lost devices and role changes, not a
-remedy for a key that may have leaked. Deep rotation is tracked on the
-roadmap.
+remedy for a key that may have leaked. For that case, `Vault::rotate` /
+`keres rotate` re-encrypts every entry under a fresh master key; it is
+deliberately slow, collapses the vault to one keyslot under the new password,
+and removes any recovery kit.
 
 Malformed slots fail closed with `InvalidVault`; a wrong passphrase across all
 slots is indistinguishable from a tampered wrapping (`Authentication`). Slot
@@ -144,9 +147,11 @@ ids and the slot count are plaintext metadata in `vault.config`.
 
 1. **No memory locking** — with `forbid(unsafe_code)` we cannot call
    `mlock`; unlocked keys may hit swap if the system has no encrypted swap.
-2. **No key rotation of content** — changing the password re-wraps the
-   master key but old ciphertext snapshots remain decryptable with the old
-   password forever.
+2. **No automatic key rotation of content** — changing the password re-wraps
+   the master key but old ciphertext snapshots remain decryptable with the
+   old password forever. Deep rotation (`Vault::rotate`) re-encrypts the
+   current vault under a fresh master key, but cannot reach snapshots an
+   attacker already copied.
 3. **No deniability** — format magics and structure identify files as
    Keres containers.
 4. **Single-factor** — no hardware-token or multi-party key splitting.

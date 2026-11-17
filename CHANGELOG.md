@@ -35,6 +35,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Vault::remove_keyslot` and `keres keyslot add|remove|list` add or revoke a
   passphrase; `change_password` re-wraps only the matching slot. Version 2
   configs are read and upgraded on the next key-changing operation.
+- Opt-in deep rotation: `Vault::rotate` / `keres rotate` generates a fresh
+  master key, streams every entry through re-encryption, and rewrites the
+  index. The new config has one keyslot under the new password, so extra
+  keyslots and any recovery kit are invalidated. A `vault.rotate` journal
+  lets the next open finish or roll back an interrupted run.
 - CLI password sources: `--password-file` and `--password-stdin`, with all
   password buffers zeroized. `--force` and an interactive confirmation guard
   destructive operations.
@@ -55,7 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   slot that matched and leaves a locked vault locked. `Vault::recover` writes
   a fresh single-slot config, dropping any additional keyslots.
 - `unlock` now takes a shared advisory lock, so it cannot read the config in
-  the middle of a concurrent password change.
+  the middle of a concurrent password change. When a rotation journal exists,
+  `unlock`, `keyslots`, `verify`, and the config-changing operations take the
+  exclusive lock first and finish the journal.
 - CI now runs doctests explicitly and gates advisories, licenses, and sources
   with `cargo-deny`; Dependabot keeps the workflow actions current.
 - Minimum supported Rust version is now 1.85, matching the current
