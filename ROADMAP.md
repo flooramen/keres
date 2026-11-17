@@ -28,8 +28,9 @@ matters most for the monorepo.
 - [ ] Public streaming API (`Read`/`Write` adapters), progress, and
       cancellation.
 - [ ] Entry metadata (mtime, mode) and `list --recursive` / `stat`.
-- [ ] Multi-recipient keys (X25519), LUKS-style key slots, and a printable
-      recovery kit.
+- [x] Printable recovery kit (`keres recovery create` / `recovery use`,
+      `Vault::create_recovery_kit` / `Vault::recover`).
+- [ ] Multi-recipient keys (X25519) and LUKS-style key slots.
 - [x] Orphan garbage collection (`verify --prune`).
 - [ ] Parallel chunk pipeline.
 

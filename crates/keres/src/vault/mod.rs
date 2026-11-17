@@ -39,8 +39,10 @@ pub(crate) mod keystore;
 pub(crate) mod lock;
 pub(crate) mod manifest;
 pub(crate) mod migrate;
+pub(crate) mod recovery;
 
 pub use migrate::MigrationReport;
+pub use recovery::RecoveryCode;
 
 use file_ops as blobs;
 use keystore::{KeyStore, VaultConfig};
@@ -520,6 +522,83 @@ impl Vault {
         let config = self.load_config()?;
         let master = config.unwrap_master_key(password)?;
         migrate::run(&self.path, &master)
+    }
+
+    /// Creates or replaces the vault's printable recovery kit.
+    ///
+    /// The master key is wrapped under a fresh 160-bit recovery code and
+    /// written to `vault.recovery` beside `vault.config`; the printed code is
+    /// returned and is **not** stored. Anyone holding both the vault directory
+    /// and the code can unlock the vault, so keep the code offline and
+    /// separate. The password is verified first.
+    ///
+    /// Creating a new kit invalidates the previous code.
+    ///
+    /// ```no_run
+    /// use keres::Vault;
+    ///
+    /// let mut vault = Vault::new("secrets".into());
+    /// let code = vault.create_recovery_kit("correct horse")?;
+    /// println!("{}", code.expose()); // print once and store offline
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn create_recovery_kit(&mut self, password: &str) -> Result<RecoveryCode> {
+        if !self.exists() {
+            return Err(Error::VaultNotFound);
+        }
+        let _lock = VaultLock::exclusive(&self.path)?;
+        let config = self.load_config()?;
+        let master = config.unwrap_master_key(password)?;
+        recovery::create(&self.path, &master)
+    }
+
+    /// Whether this vault has a recovery kit on disk.
+    pub fn has_recovery_kit(&self) -> bool {
+        recovery::exists(&self.path)
+    }
+
+    /// Resets the vault password using a recovery code.
+    ///
+    /// Works even when `vault.config` is missing or corrupt, as long as the
+    /// vault directory and `vault.recovery` survive. The recovered master key
+    /// is verified against the existing index before anything is written; on
+    /// success the config is re-wrapped under `new_password` and the recovery
+    /// kit is consumed (deleted) so the code cannot be replayed. The vault is
+    /// left locked.
+    ///
+    /// ```no_run
+    /// use keres::Vault;
+    ///
+    /// let mut vault = Vault::new("secrets".into());
+    /// vault.recover("XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX", "new password")?;
+    /// vault.unlock("new password")?;
+    /// # Ok::<(), keres::Error>(())
+    /// ```
+    pub fn recover(&mut self, recovery_code: &str, new_password: &str) -> Result<()> {
+        if !self.path.is_dir() {
+            return Err(Error::VaultNotFound);
+        }
+        let _lock = VaultLock::exclusive(&self.path)?;
+        let master = recovery::unlock(&self.path, recovery_code)?;
+
+        // Refuse to overwrite the config with a key that cannot read this
+        // vault's index (for example a recovery file copied from another
+        // vault). A legacy manifest authenticates but reports migration.
+        match manifest::load(&self.path, &master) {
+            Ok(_) | Err(Error::MigrationRequired) => {}
+            Err(_) => {
+                return Err(Error::Operation(
+                    "recovery kit does not unlock this vault's index".into(),
+                ))
+            }
+        }
+
+        let config = keystore::wrap_for_password(&master, new_password)?;
+        let json = serde_json::to_string_pretty(&config).map_err(|_| Error::InvalidVault)?;
+        crate::fsutil::atomic_write(&self.config_path(), json.as_bytes())?;
+        recovery::remove(&self.path)?;
+        self.keystore.lock();
+        Ok(())
     }
 
     /// Changes the vault password after verifying `old_password`.

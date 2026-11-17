@@ -105,6 +105,21 @@ Rules that keep this stable:
 `Vault::verify()` authenticates every blob and the manifest, reporting a
 per-entry integrity report without writing plaintext to disk.
 
+## Recovery Kit
+
+`Vault::create_recovery_kit()` writes a second wrapping of the master key to
+`vault.recovery`, protected by a random 160-bit code printed once as Crockford
+Base32 with a 16-bit checksum. Neither the code nor the master key is stored in
+plaintext. `Vault::recover()` can recreate a lost or corrupt `vault.config`
+after validating the recovered key against the encrypted index, then consumes
+the kit so the code cannot be replayed.
+
+For an attacker who steals the vault directory, the recovery file is a second
+offline guessing target; 160 bits plus Argon2id makes exhaustive search
+infeasible. The code must still be stored separately and handled like the
+vault itself. Creating a new kit replaces the old wrapping; losing both the
+code and the password remains unrecoverable.
+
 ## Known Limitations
 
 1. **No memory locking** — with `forbid(unsafe_code)` we cannot call

@@ -24,6 +24,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is committed atomically, and legacy path-addressed blobs are removed. The
   master key is unchanged (this is not key rotation), and a failure before the
   commit leaves the legacy vault readable.
+- Printable recovery kits: `Vault::create_recovery_kit` / `keres recovery
+  create` writes a second wrapping of the master key to `vault.recovery`,
+  protected by a random 160-bit Crockford Base32 code with a checksum.
+  `Vault::recover` / `keres recovery use` recreates a lost or corrupt
+  `vault.config`, validates the key against the encrypted index, resets the
+  password, and consumes the kit.
 - CLI password sources: `--password-file` and `--password-stdin`, with all
   password buffers zeroized. `--force` and an interactive confirmation guard
   destructive operations.

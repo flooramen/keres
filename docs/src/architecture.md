@@ -142,10 +142,10 @@ wrong content.
 
 ### Payload types
 
-`PayloadType` has three variants today. Adding new object kinds (future
-metadata sidecars, keyslots, recovery kits) means adding a variant with a
-new AAD context string — **never** changing existing ones. This is the
-core reason the format can evolve without a format zoo.
+`PayloadType` has three variants today. Adding new container kinds (future
+metadata sidecars or keyslots) means adding a variant with a new AAD context
+string — **never** changing existing ones. This is the core reason the format
+can evolve without a format zoo.
 
 ---
 
@@ -234,6 +234,7 @@ A vault is a directory:
 ```
 myvault/
 ├── vault.config          bootstrap JSON (plaintext structure, sealed value)
+├── vault.recovery        optional second wrapping of the master key
 ├── vault.lock            advisory inter-process lock (empty)
 └── d/
     ├── .manifest.enc     the index, as a kind-0 container
@@ -255,8 +256,8 @@ before any key exists:
 {
   "version": 2,
   "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
-  "salt": "<base64, ≥8 bytes>",
-  "wrapped_master_key": "<base64, master ‖ GCM tag>"
+  "salt": [..32 bytes..],
+  "wrapped_master_key": [..master ‖ GCM tag..]
 }
 ```
 
@@ -264,6 +265,30 @@ The master key is generated once at `init`, encrypted under the KEK with
 AAD `"keres-vault-config-v2"` and the fixed config nonce (safe: unique
 KEK, single short message). Wrong password and tampered config are
 indistinguishable (`Authentication`) by design.
+
+### vault.recovery (recovery kit)
+
+Optional. Created by `keres recovery create` / `Vault::create_recovery_kit`:
+a second, independent wrapping of the same master key.
+
+```json
+{
+  "version": 1,
+  "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
+  "salt": [..32 bytes..],
+  "nonce": [..12 bytes..],
+  "wrapped_master_key": [..master ‖ GCM tag..]
+}
+```
+
+The KEK is Argon2id over a random 160-bit code, printed once as nine groups
+of four Crockford Base32 symbols with a 16-bit checksum. The code is never
+stored. The file is not a container because it must be parsed before any key
+exists; AEAD with a random nonce and AAD `"keres-vault-recovery-v1"`
+authenticates it. `Vault::recover` validates the unwrapped master against the
+encrypted index, re-wraps `vault.config` under a new password, and consumes
+the kit. Losing `vault.config` no longer bricks the vault; losing the code
+still does.
 
 ### Blob locations
 
@@ -318,6 +343,8 @@ rewritten wholesale (temp+rename), never mutated in place.
 | `verify(pw)` | decrypts every blob (type-checked), cross-checks manifest presence; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
 | `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no manifest record references; refuses if the manifest is missing |
 | `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the manifest atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |
+| `create_recovery_kit(pw)` | verifies the password, writes `vault.recovery`, returns a one-time printable `RecoveryCode` |
+| `recover(code,new_pw)` | unwraps the master with the code, validates it against the index, re-wraps the config, consumes the kit |
 
 Directory removal walks the manifest's own child lists, so removing a
 directory removes everything beneath it even if nested names were added

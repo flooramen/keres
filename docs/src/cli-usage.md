@@ -30,6 +30,8 @@ $ keres extract personal photos ./restored
 $ keres verify personal
 $ keres verify personal --prune
 $ keres migrate legacy-vault
+$ keres recovery create personal
+$ keres recovery use personal
 $ keres change-password personal
 $ keres remove personal notes.txt
 ```
@@ -47,6 +49,8 @@ $ keres remove personal notes.txt
 | `extract <vault> <name> <dest> [--force]` | Restore an entry |
 | `verify <vault> [--prune]` | Authenticate every entry; `--prune` deletes unreferenced blobs |
 | `migrate <vault> [--force]` | Upgrade a 0.5.x (manifest v2) vault to the current format |
+| `recovery create <vault> [--force]` | Create or replace the printable recovery kit |
+| `recovery use <vault>` | Reset the password with a recovery code (consumes the kit) |
 | `change-password <vault>` | Re-wrap the master key under a new password |
 | `encrypt <input> [output] [--force]` | Encrypt one file |
 | `decrypt <input> <output> [--force]` | Decrypt one file |
@@ -62,6 +66,14 @@ without `--force` when standard input is not a terminal. `extract`,
 every entry in place, keeps the same password, commits the v3 manifest
 atomically, and then deletes the legacy blobs. Back up the vault directory
 first; the upgrade is one-way.
+
+`recovery create` prints a one-time code and writes `vault.recovery`, a
+second wrapping of the master key. Store the printed code offline and
+separately from the vault: either the vault directory or the code alone is
+not enough. `recovery use` prompts for the code, verifies it against the
+encrypted index, sets a new password, and deletes the kit so the code cannot
+be replayed. `recovery create --force` replaces an existing kit and
+invalidates its old code.
 
 `verify --prune` deletes ciphertext blobs under `d/` that no manifest entry
 references (left behind by an interrupted add) and cleans up stale temp

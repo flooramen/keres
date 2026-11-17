@@ -41,10 +41,11 @@ property will never be accepted for a compatibility or convenience win.
   rejected by the v3 reader. *(Done. `Vault::migrate` / `keres migrate`
   re-encrypts each entry under a fresh ID, commits the v3 manifest atomically,
   then removes the legacy blobs; the reader reports `MigrationRequired`.)*
-- **Recovery kit** — printable recovery code that wraps the master key
-  under a second Argon2id-derived key, stored alongside `vault.config`.
-  Mitigates the "one config file bricks everything" failure mode without
-  weakening the single-password model.
+- **Recovery kit** — printable recovery code that wraps the master key under
+  a second Argon2id-derived key, stored alongside `vault.config`. *(Done.
+  `Vault::create_recovery_kit` / `keres recovery create`; `Vault::recover`
+  recreates a lost config, validates the key against the index, and consumes
+  the kit.)*
 - **Multiple keyslots (LUKS-style)** — several independent passphrases per
   vault, each its own wrapped copy of the master key; individual slots can
   be revoked. Depends on the config schema gaining a slot table.

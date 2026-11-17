@@ -179,6 +179,11 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Create or use a printable recovery kit.
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryCommands,
+    },
     /// Encrypt a single file.
     Encrypt {
         /// Path to the file to encrypt.
@@ -198,6 +203,23 @@ enum Commands {
         /// Overwrite the output if it already exists.
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCommands {
+    /// Create or replace the vault's printable recovery kit.
+    Create {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Replace an existing kit (its old code stops working).
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Reset the vault password with a recovery code, consuming the kit.
+    Use {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
     },
 }
 
@@ -263,6 +285,15 @@ fn prompt_interactive(prompt: &str) -> Result<Zeroizing<String>> {
         // No TTY (piped input): read a plain line so scripts and CI can drive us.
         read_stdin_line()
     }
+}
+
+/// Reads a recovery code directly; password sources do not apply.
+fn read_recovery_code() -> Result<Zeroizing<String>> {
+    let code = prompt_interactive("Recovery code")?;
+    if code.trim().is_empty() {
+        return Err(Error::Operation("recovery code must not be empty".into()));
+    }
+    Ok(code)
 }
 
 /// Asks for a yes/no answer. Returns an error when there is no terminal to
@@ -485,6 +516,39 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
                 format_size(report.bytes)
             );
         }
+        Commands::Recovery { action } => match action {
+            RecoveryCommands::Create { vault, force } => {
+                let dir = existing_vault_path(&vault)?;
+                let mut v = Vault::new(dir.clone());
+                if v.has_recovery_kit() && !force {
+                    return Err(Error::Operation(format!(
+                        "vault {vault:?} already has a recovery kit; pass --force to replace it (the old code will stop working)"
+                    )));
+                }
+                let password = passwords.read("Enter vault password")?;
+                let code = v.create_recovery_kit(password.as_str())?;
+                println!("Recovery code (store it offline; it will not be shown again):");
+                println!("  {}", code.expose());
+                println!(
+                    "A wrapped copy of the master key was written to {}.",
+                    dir.join("vault.recovery").display()
+                );
+                println!("Keep the code separate from the vault: either alone is not enough.");
+            }
+            RecoveryCommands::Use { vault } => {
+                let dir = existing_vault_path(&vault)?;
+                let code = read_recovery_code()?;
+                let new = passwords.read("New password")?;
+                let confirm = passwords.read("Confirm new password")?;
+                if new.as_str() != confirm.as_str() {
+                    return Err(Error::Operation("new passwords don't match".into()));
+                }
+                Vault::new(dir).recover(code.as_str(), new.as_str())?;
+                println!(
+                    "Vault recovered. The recovery kit was consumed; create a new one if needed."
+                );
+            }
+        },
         Commands::Encrypt {
             input,
             output,

@@ -122,7 +122,7 @@ impl KeyStore {
 }
 
 /// Wraps `master` under a fresh password-derived KEK with a fresh salt.
-fn wrap_for_password(master: &Key, password: &str) -> Result<VaultConfig> {
+pub(crate) fn wrap_for_password(master: &Key, password: &str) -> Result<VaultConfig> {
     let mut salt = [0u8; 32];
     crypto::fill_random(&mut salt);
     let params = KdfParams::new();
