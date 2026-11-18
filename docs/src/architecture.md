@@ -264,16 +264,25 @@ myvault/
 ├── vault.rotate          transient deep-rotation journal (present only mid-run)
 ├── vault.lock            advisory inter-process lock (empty)
 └── d/
-    ├── .manifest.enc     the index, as a kind-0 container
+    ├── .manifest.enc     compacted index snapshot, as a kind-0 container
+    ├── .index.log        encrypted append-only mutations after the snapshot
+    ├── .index.compact    transient index-compaction journal
     ├── .manifest.enc.next  staged manifest during rotation (transient)
+    ├── .index.log.next     staged empty log during compaction (transient)
+    ├── .index.snapshot.next  staged snapshot during compaction (transient)
     └── <h2>/<h48>.enc    one blob per entry, as kind-0 containers
 ```
 
 Every mutating operation takes an exclusive advisory lock on `vault.lock`;
 read operations (`list`, `extract`, `verify`) take a shared lock. Locks are
 non-blocking: a second process gets `Error::VaultBusy` instead of waiting and
-risking a stale manifest. The lock is released when the operation returns.
+risking a stale index. The lock is released when the operation returns.
 `flock(2)` is used on Unix and `LockFileEx` on Windows via `fs4`.
+
+If a rotation or an index compaction committed but did not finish (the
+process died between its journal write and cleanup), the next operation that
+takes the lock recovers it first. A reader that only needs a shared lock
+silently upgrades to the exclusive lock for that recovery step.
 
 ### vault.config (bootstrap)
 
@@ -376,53 +385,89 @@ blob_path(entry_id) = d / sha256(master_key ‖ entry_id)[..2] /
 Paths are deterministic (stable across restarts and renames), keyed by the
 master key (so unrelated vaults never share blob names), and leak nothing but
 entry count and rough sizes via the tree shape. Because the hash input is the
-entry's stable ID rather than its path, renaming an entry only rewrites the
-encrypted manifest; no ciphertext is re-encrypted.
+entry's stable ID rather than its path, renaming an entry only updates the
+encrypted index; no ciphertext is re-encrypted.
 
-### Manifest
+### Index: snapshot + append-only log
 
-The index is a `BTreeMap<String, EntryMetadata>` serialized to JSON
-`{"version":3,"files":{...}}`, then stored as a kind-0 container with payload
-type `Manifest`. Each `EntryMetadata` records a non-empty 128-bit hex `id`,
-the original name, size, directory flag, and child lists for directories.
+The logical index is a `BTreeMap<String, EntryMetadata>` serialized to JSON.
+Each `EntryMetadata` records a non-empty 128-bit hex `id`, the original name,
+size, directory flag, and child lists for directories.
+
+The index is stored in two parts:
+
+- `d/.manifest.enc` — a compacted snapshot, written as a kind-0 container with
+  payload type `Manifest`.
+- `d/.index.log` — encrypted, authenticated mutation batches appended after
+  that snapshot.
+
+Saving an operation does **not** rewrite the whole snapshot. The library loads
+the current logical index (snapshot plus replayed log), computes the set of
+`put`/`delete` records that turn it into the new map, and appends them as one
+batch. Reading decodes the snapshot once and replays each batch in order.
+
+```
+log header:  b"KERESIDX" | version u16 | generation u64 |
+             snapshot_sha256[32] | log_id[32]
+log record:  len u32 | index u64 | nonce[12] | ciphertext || GCM tag
+```
+
+Each log gets a random `log_id`; its record key is
+`HKDF(master, log_id, "keres-vault-index-log-v1")`. Record AAD binds the full
+header bytes and the record index, so records cannot be moved between logs,
+reordered, or replayed under another generation. The header's snapshot hash
+ties the log to exactly one snapshot: mixing a log with a different snapshot
+is `InvalidVault`, and a log whose key does not authenticate is
+`Authentication`.
+
+A log is written with one `write_all` plus `sync_data` per batch. A crash may
+leave a torn final record; replay stops at the last valid record and the next
+append truncates the tail. Damage in the middle of the log is an error, never
+a silent truncation.
+
+When the log reaches 512 records or 8 MiB, the next save compacts it: a fresh
+snapshot is written, a new empty log is created that names it by SHA-256, and
+the old log is removed. Compaction is journaled in `d/.index.compact`; an
+interrupted compaction is finished on the next lock acquisition. Deep rotation
+and migration install a new snapshot and remove any log encrypted under the
+old index key.
+
 Version 2 manifests are rejected by the reader with `MigrationRequired`
 (and an empty ID in a version 3 manifest is rejected as `InvalidVault`; IDs
 are the root of blob identity, so a missing one cannot be repaired safely).
 `Vault::migrate` / `keres migrate` upgrades a v2 vault in place: it
-re-encrypts every entry under a fresh ID, then commits the v3 manifest
+re-encrypts every entry under a fresh ID, then commits the v3 snapshot
 atomically. A failure before that commit leaves the legacy manifest intact.
 
 Load semantics (hardened after audit finding #1):
 
 | State | Result |
 |---|---|
-| File absent | empty index (fresh/uninitialized data dir) |
-| Present but damaged/truncated/unauthentic | **error** — never silently empty |
-| Larger than 64 MiB read cap | rejected before allocation |
-
-A fresh random `object_salt` is generated on every save; the manifest is
-rewritten wholesale (temp+rename), never mutated in place.
+| Snapshot and log absent | empty index (fresh/uninitialized data dir) |
+| Snapshot present but damaged/truncated/unauthentic | **error** — never silently empty |
+| Log present but snapshot absent, or bound to another snapshot | **error** |
+| Snapshot larger than the 64 MiB read cap | rejected before allocation |
 
 ### Operations
 
 | API | Behavior notes |
 |---|---|
-| `init(pw)` | creates dir mode 0700, config, empty manifest |
+| `init(pw)` | creates dir mode 0700, config, empty index snapshot |
 | `unlock` / `lock` | unwraps master into memory / drops it |
-| `add(src, name)` | validates target name, rejects collisions & separators; directories recurse, creating placeholder entries; every blob temp+rename |
-| `replace(src, name)` | rewrites one existing file blob and updates its manifest record; directory entries are rejected |
-| `rename(from, to)` | top-level only; rewrites the manifest keys and child lists (for directories, the whole subtree) without touching ciphertext |
-| `list()` | reads manifest only — no blobs touched, fast |
+| `add(src, name)` | validates target name, rejects collisions & separators; directories recurse, creating placeholder entries; every blob temp+rename; index batch appended last |
+| `replace(src, name)` | rewrites one existing file blob and appends a new index record; directory entries are rejected |
+| `rename(from, to)` | top-level only; appends `put` records for the new keys and child lists (for directories, the whole subtree) without touching ciphertext |
+| `list()` | reads snapshot + log only — no blobs touched, fast |
 | `extract(name, dest)` | recreates hierarchy; names sanitized; outputs via temp+rename |
-| `remove(name)` | removes subtree: blobs *and* manifest records (no orphans from successful ops) |
+| `remove(name)` | removes subtree blobs and appends `delete` records (no orphans from successful ops) |
 | `change_password(old,new)` | verifies old, re-wraps only that keyslot; ciphertext and other slots untouched |
-| `rotate(old,new)` | deep rotation: fresh master key, all blobs re-encrypted, index rewritten; collapses to one keyslot, removes the recovery kit, leaves the vault locked; crash-safe via `vault.rotate` |
+| `rotate(old,new)` | deep rotation: fresh master key, all blobs re-encrypted, snapshot rewritten and the old log removed; collapses to one keyslot, removes the recovery kit, leaves the vault locked; crash-safe via `vault.rotate` |
 | `keyslots()` | lists plaintext slot ids; no password required |
 | `add_keyslot(existing,new)` | verifies an existing passphrase and appends an independent slot; upgrades a legacy config |
 | `remove_keyslot(id,pw)` | revokes a slot, authorized by a passphrase from a slot that remains; the last slot is refused |
-| `verify(pw)` | decrypts every blob (type-checked), cross-checks manifest presence; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
-| `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no manifest record references; refuses if the manifest is missing |
-| `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the manifest atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |
+| `verify(pw)` | decrypts every blob (type-checked), cross-checks the replayed index; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
+| `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no replayed index record references; refuses if the snapshot is missing |
+| `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the snapshot atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |
 | `create_recovery_kit(pw)` | verifies the password, writes `vault.recovery`, returns a one-time printable `RecoveryCode` |
 | `recover(code,new_pw)` | unwraps the master with the code, validates it against the index, re-wraps the config, consumes the kit |
 
@@ -447,14 +492,19 @@ Invariants: a crash may lose the *current* operation, never corrupt
 - All persistent writes go through: create temp file in same directory →
   restrict to owner-only → write → `sync_all()` → `rename()` over target →
   `sync_dir()` on the parent directory.
-- Containers are immutable once written; updates replace whole files.
-  There is no in-place mutation anywhere, which also eliminates torn-header
-  states.
-- Failure mid-add leaves unreferenced blobs (manifest unchanged) — visible
-  to nobody, and reclaimed by `verify --prune` / `Vault::prune_orphans`.
+- Containers and snapshots are immutable once written; updates replace whole
+  files via temp+rename. The index log is the one append-in-place file; it is
+  record-framed so a torn final write is detected and truncated. There are no
+  torn-header states.
+- Failure mid-add leaves unreferenced blobs (index batch not yet appended) —
+  visible to nobody, and reclaimed by `verify --prune` /
+  `Vault::prune_orphans`.
 - Deep rotation commits through `vault.rotate` before touching the canonical
-  manifest, so an interrupted run is either rolled back or completed on the
-  next open. A staged `.manifest.enc.next` without a journal is ignored.
+  index, so an interrupted run is either rolled back or completed on the next
+  open. A staged `.manifest.enc.next` without a journal is ignored.
+- Index compaction commits through `d/.index.compact` before the snapshot/log
+  swap. An interrupted run promotes or discards the staged pair on the next
+  lock acquisition; staged files without a journal are deleted.
 
 ---
 

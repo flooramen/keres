@@ -12,9 +12,9 @@ and coercion of the password itself.
 
     | Primitive | Role |
     |---|---|
-    | AES-256-GCM | AEAD for all ciphertext (chunks, trailers, manifests, wrapped keys) |
+    | AES-256-GCM | AEAD for all ciphertext (chunks, trailers, manifests, index-log records, wrapped keys) |
     | Argon2id (64 MiB, t=4, p=4) | Password → KEK; parameters serialized per container |
-    | HKDF-SHA256 | Master key → per-object subkeys; manifest key derivation |
+    | HKDF-SHA256 | Master key → per-object subkeys; manifest and index-log key derivation |
     | SHA-256 | Blob path derivation (`SHA256(master ‖ path)`), verification hash |
 
 ### Nonces
@@ -23,9 +23,14 @@ and coercion of the password itself.
   under an HKDF subkey unique to the object and its salt. Counter nonces are
   collision-free within an object regardless of size or restarts.
 - **Trailer:** reserved all-`0xFF` nonce, distinct domain from data chunks.
-- **Manifest & config wrap:** fixed nonces under keys that are themselves
-  random per vault/manifest generation — safe because the *input* key material
-  is never reused across encryptions.
+- **Manifest snapshot:** container chunk nonces under an HKDF subkey with a
+  fresh random `object_salt` on every save.
+- **Config / recovery wrap:** a fresh random 96-bit nonce for every wrapping
+  operation, under a KEK derived from that slot's own random salt.
+- **Index log:** a fresh random 96-bit nonce per record under an HKDF subkey
+  derived from the master and a random per-log `log_id`. The AAD binds the
+  authenticated log header and the record index, so records cannot be
+  reordered, spliced between logs, or replayed under another generation.
 
 ### Associated Data
 
@@ -45,7 +50,8 @@ additionally binds a `/trailer` suffix. Consequences:
 ```
 password ─Argon2id─► KEK ─wrap─► master key (vault.config)
                                     ├─► HKDF subkeys per entry blob
-                                    └─► HKDF manifest key
+                                    ├─► HKDF manifest snapshot key
+                                    └─► HKDF index-log key (per log_id)
 ```
 
 `change_password` re-wraps only the matching keyslot; no re-encryption of data.
@@ -63,7 +69,11 @@ exfiltrated.
 ## Filesystem Hardening
 
 - Atomic writes: temp file in the same directory + `fsync` + `rename`, so a
-  crash mid-write can never corrupt a vault config or manifest.
+  crash mid-write can never corrupt a vault config, snapshot, or journal.
+- The index log is the only append-in-place file. It is record-framed and
+  each batch is written with one `write_all` + `sync_data`; a torn final
+  record is detected and truncated on the next write, while damage earlier in
+  the log is reported as an authentication failure.
 - Temp files are opened with `O_CREAT | O_EXCL`, so a path that already
   exists — including a planted symlink — makes the operation fail rather
   than being written through. On Unix they are mode `0600` from creation.
@@ -100,11 +110,16 @@ Rules that keep this stable:
    it before upgrading. Vault manifests are the exception: a 0.5.x (manifest
    v2) vault returns `MigrationRequired` and is upgraded in place by
    `keres migrate` / `Vault::migrate`.
+4. Vault directories are forward-only. Since 0.7 a vault may contain an
+   append-only `d/.index.log`; pre-0.7 releases do not know about it and can
+   silently show or write a stale index. Do not alternate releases on the
+   same vault directory.
 
 ## Verification API
 
-`Vault::verify()` authenticates every blob and the manifest, reporting a
-per-entry integrity report without writing plaintext to disk.
+`Vault::verify()` authenticates every blob and the replayed index (snapshot
+plus log), reporting a per-entry integrity report without writing plaintext to
+disk.
 
 ## Recovery Kit
 
@@ -159,7 +174,12 @@ ids and the slot count are plaintext metadata in `vault.config`.
    ciphertext length (chunked at 64 KiB granularity).
 6. **Trust on first unlock** — the config stores a verification hash rather
    than a signature; there is no protection against full-storage rollback to
-   an older valid vault snapshot.
+   an older valid vault snapshot. Truncating the tail of the index log is
+   likewise indistinguishable from an interrupted append.
+7. **Operation-pattern leakage** — the index log's record count, size, and
+   approximate write order reveal how many mutations happened and roughly
+   when. Entry sizes are not padded to buckets yet; access patterns are not
+   hidden.
 
 ## Reporting
 

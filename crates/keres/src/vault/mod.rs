@@ -4,10 +4,11 @@
 //!
 //! ```text
 //! vault/
-//! |-- vault.config        encrypted master key + KDF parameters (v2 JSON)
+//! |-- vault.config        encrypted master key + KDF parameters (v3 JSON)
 //! |-- vault.lock          advisory inter-process lock (empty)
 //! +-- d/
-//!     |-- .manifest.enc   encrypted index of every entry
+//!     |-- .manifest.enc   encrypted snapshot of the index
+//!     |-- .index.log      encrypted append-only mutations after that snapshot
 //!     +-- <hash>/<hash>.enc  per-entry ciphertext blobs
 //! ```
 //!
@@ -35,6 +36,7 @@ use crate::error::{Error, Result};
 use crate::sanitize;
 
 pub(crate) mod file_ops;
+pub(crate) mod index_log;
 pub(crate) mod keystore;
 pub(crate) mod lock;
 pub(crate) mod manifest;
@@ -186,7 +188,7 @@ impl Vault {
 
         // Re-check under the lock: another process may have initialized the
         // vault between the check above and this point.
-        let _lock = VaultLock::exclusive(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         if self.exists() {
             return Err(Error::VaultExists);
         }
@@ -206,15 +208,9 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        // A committed rotation must be finished before the config is read.
-        // That path needs the exclusive lock; otherwise a shared lock still
-        // keeps `unlock` from racing a concurrent password change.
-        if rotation::pending(&self.path) {
-            let _lock = VaultLock::exclusive(&self.path)?;
-            rotation::recover(&self.path)?;
-            return self.unlock_inner(password);
-        }
-        let _lock = VaultLock::shared(&self.path)?;
+        // A pending rotation or compaction is finished under the exclusive
+        // lock before the config or index is read.
+        let _lock = self.lock_shared()?;
         self.unlock_inner(password)
     }
 
@@ -232,6 +228,26 @@ impl Vault {
 
     fn require_unlocked(&self) -> Result<Key> {
         Ok(self.keystore.master_key()?.clone())
+    }
+
+    /// Takes the exclusive vault lock, finishing any interrupted journaled
+    /// operation (rotation or index compaction) first.
+    fn lock_exclusive(&self) -> Result<VaultLock> {
+        let lock = VaultLock::exclusive(&self.path)?;
+        rotation::recover(&self.path)?;
+        index_log::recover(&self.path)?;
+        Ok(lock)
+    }
+
+    /// Takes at least a shared vault lock.
+    ///
+    /// A pending rotation or compaction needs exclusive access to finish, so
+    /// it is recovered under the exclusive lock before returning.
+    fn lock_shared(&self) -> Result<VaultLock> {
+        if rotation::pending(&self.path) || index_log::compaction_pending(&self.path) {
+            return self.lock_exclusive();
+        }
+        VaultLock::shared(&self.path)
     }
 
     /// Adds a file or directory tree to the vault.
@@ -257,7 +273,7 @@ impl Vault {
     /// ```
     pub fn add(&mut self, source: &Path, name: Option<&str>) -> Result<()> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::exclusive(&self.path)?;
+        let _lock = self.lock_exclusive()?;
 
         let source = source
             .canonicalize()
@@ -317,7 +333,7 @@ impl Vault {
     /// ```
     pub fn replace(&mut self, source: &Path, name: &str) -> Result<()> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::exclusive(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         sanitize::validate_new_name(name)?;
 
         let source = source
@@ -365,7 +381,7 @@ impl Vault {
     /// ```
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::exclusive(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         sanitize::validate_new_name(from)?;
         sanitize::validate_new_name(to)?;
         if from == to {
@@ -428,7 +444,7 @@ impl Vault {
     /// Both the ciphertext blobs and their manifest records are deleted.
     pub fn remove(&mut self, name: &str) -> Result<()> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::exclusive(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         sanitize::validate_new_name(name)?;
 
         let mut all = manifest::load(&self.path, &master)?;
@@ -445,7 +461,7 @@ impl Vault {
     /// their full `parent/child` path in other operations.
     pub fn list(&self) -> Result<Vec<EntryInfo>> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::shared(&self.path)?;
+        let _lock = self.lock_shared()?;
         let all = manifest::load(&self.path, &master)?;
         Ok(all
             .iter()
@@ -475,7 +491,7 @@ impl Vault {
     /// ```
     pub fn extract(&self, name: &str, dest: &Path) -> Result<PathBuf> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::shared(&self.path)?;
+        let _lock = self.lock_shared()?;
 
         let all = manifest::load(&self.path, &master)?;
         let meta = all
@@ -531,8 +547,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let config = self.load_config()?;
         let master = config.unwrap_master_key(password)?;
         migrate::run(&self.path, &master)
@@ -560,8 +575,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let config = self.load_config()?;
         let master = config.unwrap_master_key(password)?;
         recovery::create(&self.path, &master)
@@ -594,8 +608,7 @@ impl Vault {
         if !self.path.is_dir() {
             return Err(Error::VaultNotFound);
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let master = recovery::unlock(&self.path, recovery_code)?;
 
         // Refuse to overwrite the config with a key that cannot read this
@@ -633,12 +646,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        if rotation::pending(&self.path) {
-            let _lock = VaultLock::exclusive(&self.path)?;
-            rotation::recover(&self.path)?;
-            return Ok(self.load_config()?.slot_ids());
-        }
-        let _lock = VaultLock::shared(&self.path)?;
+        let _lock = self.lock_shared()?;
         Ok(self.load_config()?.slot_ids())
     }
 
@@ -668,8 +676,7 @@ impl Vault {
                 "new passphrase must differ from the authorizing passphrase".into(),
             ));
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let config = self.load_config()?;
         let (master, _) = config.unlock(existing_password)?;
         let (new_config, info) = config.add_slot(&master, existing_password, new_password)?;
@@ -692,8 +699,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let config = self.load_config()?;
         let (_, authorizing) = config.unlock(password)?;
         let target = config
@@ -725,8 +731,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let config = self.load_config()?;
         let (master, index) = config.unlock(old_password)?;
         let new_config = config.rewrap_slot(index, &master, new_password)?;
@@ -761,8 +766,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        let _lock = VaultLock::exclusive(&self.path)?;
-        rotation::recover(&self.path)?;
+        let _lock = self.lock_exclusive()?;
         let config = self.load_config()?;
         let (old_master, _) = config.unlock(old_password)?;
         let discarded_keyslots = config.slot_ids().len().saturating_sub(1);
@@ -801,12 +805,7 @@ impl Vault {
         if !self.exists() {
             return Err(Error::VaultNotFound);
         }
-        if rotation::pending(&self.path) {
-            let _lock = VaultLock::exclusive(&self.path)?;
-            rotation::recover(&self.path)?;
-            return self.verify_with_lock(password);
-        }
-        let _lock = VaultLock::shared(&self.path)?;
+        let _lock = self.lock_shared()?;
         self.verify_with_lock(password)
     }
 
@@ -857,7 +856,7 @@ impl Vault {
     /// index would delete every blob.
     pub fn prune_orphans(&mut self) -> Result<usize> {
         let master = self.require_unlocked()?;
-        let _lock = VaultLock::exclusive(&self.path)?;
+        let _lock = self.lock_exclusive()?;
 
         let data_dir = self.path.join("d");
         let manifest_file = data_dir.join(".manifest.enc");
@@ -1104,5 +1103,47 @@ mod tests {
             "sub/file.txt",
             "manifest names must use '/' on every platform"
         );
+    }
+
+    #[test]
+    fn shared_reads_recover_a_committed_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vault = Vault::new(tmp.path().join("vault"));
+        vault.init("pw").unwrap();
+        let src = tmp.path().join("a.txt");
+        std::fs::write(&src, b"payload").unwrap();
+        vault.add(&src, None).unwrap();
+
+        let data = vault.path().join("d");
+        let snapshot = std::fs::read(data.join(".manifest.enc")).unwrap();
+        let log = std::fs::read(data.join(".index.log")).unwrap();
+        let mut generation = [0u8; 8];
+        generation.copy_from_slice(&log[10..18]);
+
+        // Simulate a compaction that committed its journal but died before
+        // promoting the staged pair.
+        crate::fsutil::atomic_write(&data.join(".index.snapshot.next"), &snapshot).unwrap();
+        crate::fsutil::atomic_write(&data.join(".index.log.next"), &log).unwrap();
+        let journal = serde_json::json!({
+            "version": 1,
+            "generation": u64::from_le_bytes(generation),
+            "snapshot_sha256": index_log::digest(&snapshot),
+        });
+        crate::fsutil::atomic_write(
+            &data.join(".index.compact"),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+
+        // `list` only needs a shared lock, but it must finish the compaction.
+        let names: Vec<_> = vault
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["a.txt"]);
+        assert!(!data.join(".index.compact").exists());
+        assert!(!data.join(".index.snapshot.next").exists());
     }
 }

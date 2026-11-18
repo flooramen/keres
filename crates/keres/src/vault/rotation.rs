@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::fsutil;
+use crate::vault::index_log;
 use crate::vault::keystore::VaultConfig;
 use crate::vault::manifest::{self, EntryMetadata, ManifestMap};
 use crate::vault::recovery;
@@ -43,8 +44,6 @@ use super::file_ops as blobs;
 const JOURNAL_FILE: &str = "vault.rotate";
 /// Journal schema version.
 const JOURNAL_VERSION: u32 = 1;
-/// Staged manifest next to the canonical one.
-const NEXT_MANIFEST: &str = ".manifest.enc.next";
 
 /// Outcome of a successful deep rotation.
 #[derive(Debug, Default, Clone)]
@@ -129,6 +128,10 @@ pub(crate) fn run(
     fsutil::atomic_write(&vault_dir.join("vault.config"), config_json.as_bytes())?;
     report.recovery_kit_removed = recovery::exists(vault_dir);
     recovery::remove(vault_dir)?;
+
+    // The index log was encrypted under the old master and extends the old
+    // snapshot; the new snapshot replaces both.
+    index_log::remove_all(vault_dir)?;
     fsutil::remove_file_if_exists(&journal_path(vault_dir))?;
 
     // Old blobs are unreachable under the new master. Best-effort cleanup;
@@ -190,6 +193,8 @@ pub(crate) fn recover(vault_dir: &Path) -> Result<()> {
 
     fsutil::atomic_write(&vault_dir.join("vault.config"), journal.config.as_bytes())?;
     recovery::remove(vault_dir)?;
+    // The old log belonged to the pre-rotation snapshot/master.
+    index_log::remove_all(vault_dir)?;
     fsutil::remove_file_if_exists(&journal_path)?;
     Ok(())
 }
@@ -199,7 +204,7 @@ fn journal_path(vault_dir: &Path) -> PathBuf {
 }
 
 fn next_manifest_path(vault_dir: &Path) -> PathBuf {
-    vault_dir.join("d").join(NEXT_MANIFEST)
+    manifest::next_path(vault_dir)
 }
 
 /// Streams one old file blob into a new-master blob.

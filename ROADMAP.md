@@ -37,6 +37,9 @@ matters most for the monorepo.
       to one keyslot and removes the recovery kit.
 - [ ] Multi-recipient keys (X25519).
 - [x] Orphan garbage collection (`verify --prune`).
+- [x] Append-only encrypted index log with snapshot compaction, journaled
+      crash recovery, and automatic journal recovery on lock acquisition.
+- [ ] Size padding to buckets and operation-count bucketing (L2+).
 - [ ] Parallel chunk pipeline.
 
 ## Later

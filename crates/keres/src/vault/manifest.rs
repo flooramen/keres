@@ -3,10 +3,18 @@
 //! The manifest maps each entry's full vault-relative path to its metadata,
 //! including the child lists that make recursive removal possible.
 //!
-//! Stored at `d/.manifest.enc` as a universal keres container (see
-//! [`crate::container`]) with HKDF-from-master key derivation and payload
-//! type `manifest`; the index JSON is carried in the chunk section, so
-//! manifests grow past any artificial size limit.
+//! The index is stored in two parts:
+//!
+//! * `d/.manifest.enc` — a complete snapshot, written as a universal keres
+//!   container (see [`crate::container`]) with HKDF-from-master key
+//!   derivation and payload type `manifest`. The index JSON is carried in the
+//!   chunk section, so manifests grow past any artificial size limit.
+//! * `d/.index.log` — an append-only log of encrypted mutation batches that
+//!   extend the snapshot (see [`super::index_log`]).
+//!
+//! [`load`] decodes the snapshot and replays the log; [`save`] computes a diff
+//! against the current index, appends one authenticated batch, and compacts
+//! into a fresh snapshot when the log grows large.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -18,6 +26,11 @@ use zeroize::Zeroizing;
 use crate::container::{self, KeyDerivation, PayloadType};
 use crate::crypto::{self, Key};
 use crate::error::{Error, Result};
+use crate::fsutil;
+use crate::vault::index_log::{self, LogOp};
+
+/// SHA-256 length used to bind a log to its snapshot.
+const HASH_LEN: usize = 32;
 
 /// Upper bound on accepted manifest plaintext, guarding against hostile
 /// on-disk files forcing huge allocations (a real vault would need tens of
@@ -28,7 +41,7 @@ const MAX_MANIFEST_LEN: u64 = 64 * 1024 * 1024;
 pub(crate) const MANIFEST_VERSION: u32 = 3;
 
 /// Metadata for one vault entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryMetadata {
     /// Stable random identifier. Blob location and container AAD are derived
     /// from it, so entries can be renamed without re-encrypting.
@@ -61,6 +74,11 @@ pub(crate) fn path(vault_dir: &Path) -> std::path::PathBuf {
     vault_dir.join("d").join(".manifest.enc")
 }
 
+/// Staging path used by deep rotation.
+pub(crate) fn next_path(vault_dir: &Path) -> std::path::PathBuf {
+    vault_dir.join("d").join(".manifest.enc.next")
+}
+
 /// A decoded manifest, tagged by its on-disk schema version.
 pub(crate) enum ManifestContents {
     /// Legacy 0.4/0.5 index: blobs are addressed by entry path and entries
@@ -70,16 +88,29 @@ pub(crate) enum ManifestContents {
     V3(ManifestMap),
 }
 
-/// Loads the manifest, fully authenticating its container.
+/// Loads the manifest, fully authenticating its snapshot and log.
 ///
-/// A *missing* manifest yields an empty index; anything present but damaged,
+/// A *missing* snapshot yields an empty index; anything present but damaged,
 /// truncated or unauthentic is an error — silently treating corruption as
-/// "no entries" would let the next save drop every existing record.
+/// "no entries" would let the next save drop every existing record. A log that
+/// references a different snapshot is likewise an error.
 pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
+    let (mut files, snapshot_sha256) = load_snapshot(vault_dir, master)?;
+    index_log::replay(vault_dir, master, &mut files, snapshot_sha256.as_ref())?;
+    Ok(files)
+}
+
+/// Reads and decodes the snapshot, returning its hash for log binding.
+///
+/// The hash is `None` only when no snapshot exists (a new or unmigrated
+/// vault); callers must reject a log in that case.
+fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(ManifestMap, Option<[u8; HASH_LEN]>)> {
     let path = path(vault_dir);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ManifestMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((ManifestMap::new(), None))
+        }
         Err(e) => return Err(e.into()),
     };
 
@@ -88,7 +119,8 @@ pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
         .read_to_end(&mut bytes)
         .map_err(|_| Error::InvalidVault)?;
 
-    decode(&bytes, master)
+    let snapshot_sha256 = index_log::digest(&bytes);
+    Ok((decode(&bytes, master)?, Some(snapshot_sha256)))
 }
 
 /// Decodes and authenticates manifest bytes. Shared by [`load`] and the
@@ -160,11 +192,81 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
     }
 }
 
-/// Atomically saves the manifest as a fresh container (new object salt on
-/// every write).
+/// Commits `files` to the index.
+///
+/// Existing state is loaded once, the difference is appended as a single
+/// authenticated log batch, and a fresh snapshot is written when the log has
+/// accumulated enough records. A missing snapshot is written directly (new
+/// vault or legacy migration). Callers hold the exclusive vault lock.
 pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Result<()> {
-    let blob = encode(files, master)?;
-    crate::fsutil::atomic_write(&path(vault_dir), &blob)
+    let (mut current, snapshot_sha256) = match load_snapshot(vault_dir, master) {
+        Ok(state) => state,
+        Err(Error::MigrationRequired) => {
+            // The legacy index is replaced wholesale; never try to merge with
+            // records that belong to another schema.
+            index_log::remove_all(vault_dir)?;
+            let blob = encode(files, master)?;
+            return fsutil::atomic_write(&path(vault_dir), &blob);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let Some(snapshot_sha256) = snapshot_sha256 else {
+        // No snapshot yet. A log cannot extend nothing, so its presence means
+        // the index was lost or damaged.
+        if index_log::exists(vault_dir) {
+            return Err(Error::InvalidVault);
+        }
+        index_log::remove_all(vault_dir)?;
+        let blob = encode(files, master)?;
+        return fsutil::atomic_write(&path(vault_dir), &blob);
+    };
+
+    let log = index_log::replay(vault_dir, master, &mut current, Some(&snapshot_sha256))?;
+
+    if current == *files {
+        return Ok(());
+    }
+
+    if log.as_ref().is_some_and(|info| info.should_compact()) {
+        let generation = log.as_ref().map_or(1, |info| info.generation + 1);
+        let blob = encode(files, master)?;
+        return index_log::compact(vault_dir, &blob, generation);
+    }
+
+    let ops = diff(&current, files);
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let generation = log.as_ref().map_or(1, |info| info.generation);
+    index_log::append(
+        vault_dir,
+        master,
+        &snapshot_sha256,
+        generation,
+        log.as_ref(),
+        &ops,
+    )?;
+    Ok(())
+}
+
+/// Computes the mutation batch that turns `old` into `new`.
+fn diff(old: &ManifestMap, new: &ManifestMap) -> Vec<LogOp> {
+    let mut ops = Vec::new();
+    for (path, entry) in new {
+        if old.get(path) != Some(entry) {
+            ops.push(LogOp::Put {
+                path: path.clone(),
+                entry: entry.clone(),
+            });
+        }
+    }
+    for path in old.keys() {
+        if !new.contains_key(path) {
+            ops.push(LogOp::Delete { path: path.clone() });
+        }
+    }
+    ops
 }
 
 /// Encodes the manifest as a fresh container under `master`.
@@ -196,4 +298,85 @@ pub(crate) fn encode(files: &ManifestMap, master: &Key) -> Result<Vec<u8>> {
     )?;
 
     Ok(blob)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::index_log;
+
+    fn temp_vault() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("d")).unwrap();
+        tmp
+    }
+
+    fn meta(name: &str) -> EntryMetadata {
+        EntryMetadata {
+            id: format!("id-{name}"),
+            original_name: name.into(),
+            original_size: 1,
+            is_directory: false,
+            children: None,
+        }
+    }
+
+    fn log_len(vault_dir: &Path) -> u64 {
+        std::fs::metadata(vault_dir.join("d").join(index_log::LOG_FILE))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn saves_append_to_the_log_without_rewriting_the_snapshot() {
+        let tmp = temp_vault();
+        let dir = tmp.path();
+        let master = Key::generate();
+
+        let mut files = ManifestMap::new();
+        save(dir, &files, &master).unwrap();
+        let snapshot = std::fs::read(path(dir)).unwrap();
+        assert!(!index_log::exists(dir));
+
+        files.insert("a".into(), meta("a"));
+        files.insert("b".into(), meta("b"));
+        save(dir, &files, &master).unwrap();
+
+        // The snapshot bytes are untouched; mutations live in the log.
+        assert_eq!(std::fs::read(path(dir)).unwrap(), snapshot);
+        assert!(index_log::exists(dir));
+        assert_eq!(load(dir, &master).unwrap(), files);
+
+        // Deletes are recorded too.
+        files.remove("a");
+        save(dir, &files, &master).unwrap();
+        assert_eq!(std::fs::read(path(dir)).unwrap(), snapshot);
+        assert_eq!(load(dir, &master).unwrap(), files);
+    }
+
+    #[test]
+    fn a_large_log_is_compacted_into_a_fresh_snapshot() {
+        let tmp = temp_vault();
+        let dir = tmp.path();
+        let master = Key::generate();
+
+        let mut files = ManifestMap::new();
+        save(dir, &files, &master).unwrap();
+        let original = std::fs::read(path(dir)).unwrap();
+
+        for i in 0..512 {
+            files.insert(format!("e{i}"), meta(&format!("e{i}")));
+            save(dir, &files, &master).unwrap();
+        }
+        assert!(log_len(dir) > 200, "expected a populated log");
+        assert_eq!(std::fs::read(path(dir)).unwrap(), original);
+
+        // The next save reaches the record threshold and compacts.
+        files.insert("after".into(), meta("after"));
+        save(dir, &files, &master).unwrap();
+
+        assert!(std::fs::read(path(dir)).unwrap() != original);
+        assert!(log_len(dir) < 200, "log should restart after compaction");
+        assert_eq!(load(dir, &master).unwrap(), files);
+    }
 }

@@ -76,6 +76,21 @@ property will never be accepted for a compatibility or convenience win.
   nested-directory tests guard against behavior drift. Considered and
   rejected for now to avoid touching a verified codebase.
 
+## Next (0.7.x)
+
+- **Append-only encrypted index** — stop rewriting the whole manifest on every
+  mutation. *(Done. Snapshot plus `d/.index.log`: authenticated `put`/`delete`
+  batches, per-log keys, snapshot/generation binding, 512-record or 8 MiB
+  compaction, and journaled compaction recovery.)*
+- **Group commit** — coalesce concurrent writers into one durable batch so a
+  busy vault pays for one `sync_data` per group rather than per mutation.
+- **Index generations and rollback detection** — carry a monotonic generation
+  in the snapshot/log header and config, making restored older index state
+  detectable on unlock (limitation 6).
+- **L2+ metadata protection** — pad entry sizes to fixed buckets, coarsen
+  observable timing, and optionally bucket mutation counts. Explicit
+  non-goals: access-pattern hiding, exact-count hiding, and deniability.
+
 ## Later (1.0 candidates)
 
 - **Hardware-backed keys** — optional second factor via OS key stores

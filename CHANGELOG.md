@@ -4,6 +4,26 @@ All notable changes to this workspace are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.7.0
+
+### Added
+
+- Append-only encrypted index log. Vault mutations now append authenticated
+  `put`/`delete` batches to `d/.index.log` instead of rewriting the whole
+  `d/.manifest.enc` snapshot. A batch is keyed from the master and a random
+  per-log id, uses a fresh nonce, and binds the log header plus record index
+  in its AAD. Loading decodes the snapshot and replays the log; the next save
+  compacts into a fresh snapshot after 512 records or 8 MiB. Compaction is
+  journaled in `d/.index.compact`, and deep rotation or migration discard any
+  log encrypted under the old index.
+
+### Changed
+
+- Vault locking now recovers interrupted journals centrally. Both exclusive
+  and shared lock acquisition finish a committed rotation or index compaction
+  before the config or index is read, so a crash between a journal write and
+  its cleanup cannot make the vault unreadable.
+
 ## [Unreleased] — 0.6.0
 
 ### Added

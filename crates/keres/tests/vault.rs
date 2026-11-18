@@ -120,12 +120,12 @@ fn directory_tree_roundtrip_and_recursive_remove() {
     v.remove("photos").unwrap();
     assert!(v.list().unwrap().is_empty());
 
-    // No orphan blobs: data dir holds only the manifest.
+    // No orphan blobs: data dir holds only index metadata files.
     let data_dir = v.path().join("d");
     let leftovers: Vec<_> = std::fs::read_dir(&data_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file() && e.file_name().to_string_lossy() != ".manifest.enc")
+        .filter(|e| e.path().is_file() && !e.file_name().to_string_lossy().starts_with('.'))
         .collect();
     assert!(leftovers.is_empty(), "orphaned files: {leftovers:?}");
     for entry in std::fs::read_dir(&data_dir).unwrap().filter_map(|e| e.ok()) {
@@ -521,4 +521,68 @@ fn recovery_resets_to_a_single_keyslot() {
     assert!(Vault::new(dir.clone()).unlock("master-password").is_err());
     assert!(Vault::new(dir.clone()).unlock("second").is_err());
     assert!(Vault::new(dir).unlock("after-recovery").is_ok());
+}
+
+#[test]
+fn mutations_are_journaled_in_the_index_log() {
+    let (dir, mut v) = make_vault("indexlog");
+    let parent = v.path().parent().unwrap().to_path_buf();
+    let snapshot_path = v.path().join("d").join(".manifest.enc");
+    let log_path = v.path().join("d").join(".index.log");
+
+    // `init` writes only the snapshot.
+    assert!(snapshot_path.is_file());
+    assert!(!log_path.exists());
+    let snapshot = std::fs::read(&snapshot_path).unwrap();
+
+    let a = parent.join("a.txt");
+    std::fs::write(&a, b"alpha").unwrap();
+    v.add(&a, None).unwrap();
+    let b = parent.join("b.txt");
+    std::fs::write(&b, b"beta").unwrap();
+    v.add(&b, None).unwrap();
+
+    // Mutations append to the log instead of rewriting the snapshot.
+    assert!(log_path.is_file());
+    assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot);
+
+    v.lock();
+    drop(v);
+    let mut reopened = Vault::new(dir.path().join("vault"));
+    reopened.unlock("master-password").unwrap();
+    let names: Vec<_> = reopened
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, vec!["a.txt", "b.txt"]);
+
+    reopened.remove("a.txt").unwrap();
+    reopened.lock();
+    drop(reopened);
+
+    let mut again = Vault::new(dir.path().join("vault"));
+    again.unlock("master-password").unwrap();
+    let names: Vec<_> = again.list().unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, vec!["b.txt"]);
+}
+
+#[test]
+fn orphaned_compaction_staging_is_cleaned_up() {
+    let (_d, mut v) = make_vault("stagedlog");
+    let parent = v.path().parent().unwrap().to_path_buf();
+    let staged = v.path().join("d").join(".index.log.next");
+    std::fs::write(&staged, b"interrupted write").unwrap();
+
+    let src = parent.join("after-crash.txt");
+    std::fs::write(&src, b"payload").unwrap();
+    v.add(&src, None).unwrap();
+
+    assert!(!staged.exists());
+    assert!(v
+        .list()
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "after-crash.txt"));
 }
