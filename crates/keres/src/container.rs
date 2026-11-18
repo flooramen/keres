@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 use crate::crypto::{self, Key};
 use crate::error::{Error, Result};
 use crate::kdf::KdfParams;
+use crate::padding::Padding;
 use crate::stream;
 
 /// Magic header shared by every Keres container.
@@ -41,14 +42,27 @@ use crate::stream;
 /// occurring in ordinary text and survive naive character-set mangling.
 pub const MAGIC: &[u8; 8] = b"KERES\0\0\0";
 
-/// Current envelope version. Written into every container; readers reject
-/// any other value with [`Error::UnsupportedVersion`].
+/// Current envelope version for unpadded containers. Written into every
+/// unpadded container; readers reject unknown values with
+/// [`Error::UnsupportedVersion`].
 pub const ENVELOPE_VERSION: u16 = 1;
+
+/// Envelope version used by size-padded containers. It adds one authenticated
+/// metadata record before the chunk section that carries the real plaintext
+/// size, letting readers trim before yielding plaintext.
+pub(crate) const ENVELOPE_VERSION_PADDED: u16 = 2;
 
 pub(crate) const SALT_LEN: usize = crate::crypto::SALT_LEN;
 const HKDF_INFO: &[u8] = b"keres-container-v1";
 const KIND_HKDF: u8 = 0;
 const KIND_PASSWORD: u8 = 1;
+
+/// Reserved nonce for the optional padding metadata record.
+const PADDING_NONCE: crypto::Nonce12 = [0xFEu8; 12];
+/// AAD for the padding metadata record.
+const PADDING_AAD: &[u8] = b"keres-container-v2/padding";
+/// Upper bound on an accepted padding metadata record.
+const MAX_PADDING_HEADER_LEN: usize = 4096;
 
 /// What a container holds. Serialized into the authenticated trailer and
 /// bound into chunk AAD, so records cannot be transplanted between payload
@@ -65,14 +79,21 @@ pub enum PayloadType {
 }
 
 impl PayloadType {
-    pub(crate) fn context(self) -> Vec<u8> {
-        let mut c = b"keres-container-v1/".to_vec();
+    pub(crate) fn context(self, version: u16) -> Result<Vec<u8>> {
+        let version = match version {
+            ENVELOPE_VERSION => &b"v1"[..],
+            ENVELOPE_VERSION_PADDED => &b"v2"[..],
+            other => return Err(Error::UnsupportedVersion(u32::from(other))),
+        };
+        let mut c = b"keres-container-".to_vec();
+        c.extend_from_slice(version);
+        c.push(b'/');
         c.extend_from_slice(match self {
             PayloadType::File => &b"file"[..],
             PayloadType::Directory => &b"directory"[..],
             PayloadType::Manifest => &b"manifest"[..],
         });
-        c
+        Ok(c)
     }
 }
 
@@ -116,10 +137,10 @@ impl KeyDerivation {
             }
     }
 
-    pub(crate) fn write_header<W: Write>(&self, w: &mut W) -> Result<()> {
+    pub(crate) fn write_header<W: Write>(&self, w: &mut W, version: u16) -> Result<()> {
         let mut head = Vec::with_capacity(self.header_len());
         head.extend_from_slice(MAGIC);
-        head.extend_from_slice(&ENVELOPE_VERSION.to_le_bytes());
+        head.extend_from_slice(&version.to_le_bytes());
         head.push(self.kind());
         match self {
             KeyDerivation::Hkdf { object_salt } => head.extend_from_slice(object_salt),
@@ -139,23 +160,23 @@ impl KeyDerivation {
         Ok(())
     }
 
-    pub(crate) fn parse_header(head: &[u8]) -> Result<Self> {
+    pub(crate) fn parse_header(head: &[u8]) -> Result<(Self, u16)> {
         if head.len() < MAGIC.len() + 3 || &head[..MAGIC.len()] != MAGIC {
             return Err(Error::IncompatibleFormat);
         }
         let version = u16::from_le_bytes([head[8], head[9]]);
-        if version != ENVELOPE_VERSION {
+        if version != ENVELOPE_VERSION && version != ENVELOPE_VERSION_PADDED {
             return Err(Error::UnsupportedVersion(u32::from(version)));
         }
         let body = &head[11..];
-        match head[10] {
+        let kd = match head[10] {
             KIND_HKDF => {
                 if body.len() != SALT_LEN {
                     return Err(Error::InvalidHeader);
                 }
                 let mut object_salt = [0u8; SALT_LEN];
                 object_salt.copy_from_slice(body);
-                Ok(KeyDerivation::Hkdf { object_salt })
+                KeyDerivation::Hkdf { object_salt }
             }
             KIND_PASSWORD => {
                 if body.len() != 2 * SALT_LEN + KdfParams::SERIALIZED_LEN {
@@ -166,14 +187,15 @@ impl KeyDerivation {
                 let mut object_salt = [0u8; SALT_LEN];
                 object_salt.copy_from_slice(&body[SALT_LEN..2 * SALT_LEN]);
                 let params = KdfParams::read_from(&body[2 * SALT_LEN..])?;
-                Ok(KeyDerivation::Password {
+                KeyDerivation::Password {
                     argon_salt,
                     object_salt,
                     params,
-                })
+                }
             }
-            _ => Err(Error::InvalidHeader),
-        }
+            _ => return Err(Error::InvalidHeader),
+        };
+        Ok((kd, version))
     }
 
     pub(crate) fn content_key(
@@ -218,6 +240,78 @@ pub(crate) struct Trailer {
     pub chunk_count: u32,
 }
 
+/// Authenticated metadata carried by size-padded containers before the chunk
+/// section. The real size lets a reader trim padding before yielding any
+/// plaintext; the trailer binds the padded length and chunk count.
+///
+/// The encoding is fixed-width (25 bytes) so the record length does not leak
+/// the number of digits in the real size or which policy is in use.
+#[derive(Debug)]
+pub(crate) struct PaddingHeader {
+    /// Real plaintext length.
+    pub size: u64,
+    /// Padded plaintext length actually present in the chunk section.
+    pub padded_size: u64,
+    /// Policy used to choose `padded_size`.
+    pub padding: Padding,
+}
+
+/// Plaintext length of an encoded [`PaddingHeader`].
+const PADDING_HEADER_LEN: usize = 8 + 8 + 1 + 8;
+
+impl PaddingHeader {
+    fn encode(&self) -> Vec<u8> {
+        let (mode, fixed) = match self.padding {
+            Padding::None => (0u8, 0u64),
+            Padding::Adaptive => (1, 0),
+            Padding::Fixed { size } => (2, size),
+        };
+        let mut out = Vec::with_capacity(PADDING_HEADER_LEN);
+        out.extend_from_slice(&self.size.to_be_bytes());
+        out.extend_from_slice(&self.padded_size.to_be_bytes());
+        out.push(mode);
+        out.extend_from_slice(&fixed.to_be_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != PADDING_HEADER_LEN {
+            return Err(Error::MalformedPayload);
+        }
+        let size = u64::from_be_bytes(bytes[..8].try_into().expect("fixed slice"));
+        let padded_size = u64::from_be_bytes(bytes[8..16].try_into().expect("fixed slice"));
+        let mode = bytes[16];
+        let fixed = u64::from_be_bytes(bytes[17..25].try_into().expect("fixed slice"));
+        let padding = match (mode, fixed) {
+            (0, 0) => Padding::None,
+            (1, 0) => Padding::Adaptive,
+            (2, size) => Padding::Fixed { size },
+            _ => return Err(Error::MalformedPayload),
+        };
+        let header = Self {
+            size,
+            padded_size,
+            padding,
+        };
+        header.validate()?;
+        Ok(header)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.padded_size < self.size {
+            return Err(Error::MalformedPayload);
+        }
+        let expected = self
+            .padding
+            .padded_len(self.size)
+            .map_err(|_| Error::MalformedPayload)?;
+        if expected != self.padded_size {
+            return Err(Error::MalformedPayload);
+        }
+        Ok(())
+    }
+}
+
 fn trailer_aad(context: &[u8]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(context.len() + 8);
     aad.extend_from_slice(context);
@@ -225,11 +319,18 @@ fn trailer_aad(context: &[u8]) -> Vec<u8> {
     aad
 }
 
+/// A parsed container header plus the envelope version that determines the
+/// record AAD domain and whether a padding metadata record follows.
+pub(crate) struct ContainerHeader {
+    pub kd: KeyDerivation,
+    pub version: u16,
+}
+
 /// Reads a container header (magic, version, kind byte, kind data).
 ///
 /// Shared by the whole-container reader and the public streaming reader, so
 /// both accept exactly the same envelope.
-pub(crate) fn read_header<R: Read>(inner: &mut R) -> Result<KeyDerivation> {
+pub(crate) fn read_header<R: Read>(inner: &mut R) -> Result<ContainerHeader> {
     let mut first = vec![0u8; MAGIC.len() + 3];
     inner
         .read_exact(&mut first)
@@ -247,7 +348,41 @@ pub(crate) fn read_header<R: Read>(inner: &mut R) -> Result<KeyDerivation> {
         .read_exact(&mut rest)
         .map_err(|_| Error::InvalidHeader)?;
     first.extend_from_slice(&rest);
-    KeyDerivation::parse_header(&first)
+    let (kd, version) = KeyDerivation::parse_header(&first)?;
+    Ok(ContainerHeader { kd, version })
+}
+
+/// Writes the authenticated padding metadata record used by envelope v2.
+fn write_padding_header<W: Write>(
+    dst: &mut W,
+    content_key: &Key,
+    padding: Padding,
+    size: u64,
+    padded_size: u64,
+) -> Result<()> {
+    let header = PaddingHeader {
+        size,
+        padded_size,
+        padding,
+    };
+    let mut payload = Zeroizing::new(header.encode());
+    crypto::seal_in_place(&PADDING_NONCE, &mut payload, content_key, PADDING_AAD)?;
+    dst.write_all(&(payload.len() as u32).to_le_bytes())?;
+    dst.write_all(payload.as_slice())?;
+    Ok(())
+}
+
+/// Reads and authenticates the padding metadata record used by envelope v2.
+pub(crate) fn read_padding_header<R: Read>(
+    src: &mut R,
+    content_key: &Key,
+) -> Result<PaddingHeader> {
+    let mut rec = Zeroizing::new(stream::read_record(src, MAX_PADDING_HEADER_LEN)?);
+    if rec.len() != PADDING_HEADER_LEN + crypto::TAG_LEN {
+        return Err(Error::InvalidHeader);
+    }
+    crypto::open_in_place(&PADDING_NONCE, &mut rec, content_key, PADDING_AAD)?;
+    PaddingHeader::decode(rec.as_slice())
 }
 
 /// Writes the authenticated trailer record, including the end-of-chunks
@@ -256,11 +391,12 @@ pub(crate) fn write_trailer<W: Write>(
     dst: &mut W,
     content_key: &Key,
     typ: PayloadType,
+    version: u16,
     name: Option<&str>,
     size: u64,
     chunk_count: u32,
 ) -> Result<()> {
-    let context = typ.context();
+    let context = typ.context(version)?;
     let mut payload = Zeroizing::new(
         serde_json::to_vec(&Trailer {
             typ,
@@ -290,8 +426,9 @@ pub(crate) fn read_trailer<R: Read>(
     src: &mut R,
     content_key: &Key,
     expected: PayloadType,
+    version: u16,
 ) -> Result<Trailer> {
-    let context = expected.context();
+    let context = expected.context(version)?;
     let mut rec = Zeroizing::new(stream::read_record(src, stream::MAX_TRAILER_LEN)?);
     crypto::open_in_place(
         &stream::TRAILER_NONCE,
@@ -339,6 +476,11 @@ pub(crate) fn password_key_derivation() -> KeyDerivation {
 /// Pass `b""` for self-contained objects. `src: None` yields chunk-less
 /// payloads (directory placeholders). Exactly one of `password`/`master`
 /// is required, matching `kd`.
+///
+/// A non-[`Padding::None`] policy switches to envelope v2: the real size is
+/// written in an authenticated prelude, the source is padded up to its bucket,
+/// and `source_len` must supply the exact number of plaintext bytes `src`
+/// will produce. Padding is only meaningful for [`PayloadType::File`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_container<W: Write>(
     dst: &mut W,
@@ -349,40 +491,135 @@ pub(crate) fn write_container<W: Write>(
     identity: &[u8],
     src: Option<&mut dyn Read>,
     trailer_name: Option<&str>,
+    padding: Padding,
+    source_len: Option<u64>,
 ) -> Result<(u64, u32)> {
     let content_key = kd.content_key(password, master, identity)?;
-    kd.write_header(dst)?;
-    let context = typ.context();
+
+    if padding != Padding::None {
+        if typ != PayloadType::File {
+            return Err(Error::Operation(
+                "size padding is only supported for file payloads".into(),
+            ));
+        }
+        let source =
+            src.ok_or_else(|| Error::Operation("size padding requires a non-empty source".into()))?;
+        let source_len = source_len.ok_or_else(|| {
+            Error::Operation("size padding requires a known source length".into())
+        })?;
+        let padded_len = padding.padded_len(source_len)?;
+        let version = ENVELOPE_VERSION_PADDED;
+        let context = typ.context(version)?;
+
+        kd.write_header(dst, version)?;
+        write_padding_header(dst, &content_key, padding, source_len, padded_len)?;
+        let (total, count) = stream::write_chunks_padded(
+            dst,
+            source,
+            &content_key,
+            &context,
+            source_len,
+            padded_len,
+        )?;
+        // The v2 trailer binds the padded length and chunk count. The real
+        // size lives in the fixed-width prelude, so the trailer's length does
+        // not leak the number of digits in the plaintext size.
+        write_trailer(
+            dst,
+            &content_key,
+            typ,
+            version,
+            trailer_name,
+            padded_len,
+            count,
+        )?;
+        debug_assert_eq!(total, source_len);
+        return Ok((total, count));
+    }
+
+    let version = ENVELOPE_VERSION;
+    let context = typ.context(version)?;
+    kd.write_header(dst, version)?;
 
     let (total, count) = match src {
         Some(r) => stream::write_chunks(dst, r, &content_key, &context)?,
         None => (0, 0),
     };
 
-    write_trailer(dst, &content_key, typ, trailer_name, total, count)?;
+    write_trailer(dst, &content_key, typ, version, trailer_name, total, count)?;
     Ok((total, count))
 }
 
 /// Reads and authenticates a whole container, streaming plaintext chunks to
 /// `sink`. Verifies the trailer against observed bytes and checks the
 /// payload type matches `expected`. Returns the trailer.
+///
+/// Padded containers are trimmed to their authenticated real size before any
+/// byte reaches `sink`; `trailer.size` is always the real plaintext length.
 pub(crate) fn read_container<R: Read>(
     mut inner: R,
     password: Option<&str>,
     master: Option<&Key>,
     expected: PayloadType,
     identity: &[u8],
-    sink: impl FnMut(&[u8]) -> Result<()>,
+    mut sink: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<Trailer> {
-    let kd = read_header(&mut inner)?;
-    let content_key = kd.content_key(password, master, identity)?;
-    let context = expected.context();
+    let header = read_header(&mut inner)?;
+    let version = header.version;
+    let content_key = header.kd.content_key(password, master, identity)?;
+    let context = expected.context(version)?;
 
-    let (total, count) = stream::read_chunks(&mut inner, &content_key, &context, sink)?;
-    let trailer = read_trailer(&mut inner, &content_key, expected)?;
+    let padding_header = if version == ENVELOPE_VERSION_PADDED {
+        if expected != PayloadType::File {
+            return Err(Error::InvalidHeader);
+        }
+        Some(read_padding_header(&mut inner, &content_key)?)
+    } else {
+        None
+    };
 
-    if trailer.size != total || trailer.chunk_count != count {
-        return Err(Error::Authentication);
+    // `remaining` is the number of real bytes still owed to `sink`. It is
+    // `None` for unpadded v1 containers, whose chunks are all real data.
+    let mut remaining = padding_header.as_ref().map(|header| header.size);
+    let (observed, count) =
+        stream::read_chunks(
+            &mut inner,
+            &content_key,
+            &context,
+            |chunk| match remaining.as_mut() {
+                Some(left) => {
+                    let take = (*left).min(chunk.len() as u64) as usize;
+                    if take > 0 {
+                        sink(&chunk[..take])?;
+                        *left -= take as u64;
+                    }
+                    Ok(())
+                }
+                None => sink(chunk),
+            },
+        )?;
+
+    let mut trailer = read_trailer(&mut inner, &content_key, expected, version)?;
+    match &padding_header {
+        Some(header) => {
+            // The v2 trailer binds the padded length (never the real size):
+            // its record length must not reveal how many digits the real size
+            // has. The authenticated prelude supplies the real size, and the
+            // returned trailer is normalized to it so callers never see the
+            // padding.
+            if observed != header.padded_size || remaining != Some(0) {
+                return Err(Error::Authentication);
+            }
+            if trailer.size != header.padded_size || trailer.chunk_count != count {
+                return Err(Error::Authentication);
+            }
+            trailer.size = header.size;
+        }
+        None => {
+            if trailer.size != observed || trailer.chunk_count != count {
+                return Err(Error::Authentication);
+            }
+        }
     }
 
     ensure_eof(&mut inner)?;
@@ -421,7 +658,44 @@ mod tests {
     ) -> Vec<u8> {
         let mut out = Vec::new();
         let mut src = Cursor::new(data.to_vec());
-        write_container(&mut out, kd, pw, m, typ, b"", Some(&mut src), None).unwrap();
+        write_container(
+            &mut out,
+            kd,
+            pw,
+            m,
+            typ,
+            b"",
+            Some(&mut src),
+            None,
+            Padding::None,
+            None,
+        )
+        .unwrap();
+        out
+    }
+
+    fn seal_padded(
+        kd: &KeyDerivation,
+        pw: Option<&str>,
+        m: Option<&Key>,
+        data: &[u8],
+        padding: Padding,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut src = Cursor::new(data.to_vec());
+        write_container(
+            &mut out,
+            kd,
+            pw,
+            m,
+            PayloadType::File,
+            b"",
+            Some(&mut src),
+            None,
+            padding,
+            Some(data.len() as u64),
+        )
+        .unwrap();
         out
     }
 
@@ -617,5 +891,142 @@ mod tests {
         .is_err());
         // Correct location still works and returns the trailer.
         assert!(unseal_id(&blob, None, Some(&master), PayloadType::File, b"").is_ok());
+    }
+
+    #[test]
+    fn padded_containers_trim_to_the_real_size() {
+        let master = Key::generate();
+        let padding = Padding::Adaptive;
+        for len in [0usize, 1, 4095, 4096, 4097, 70_000, 16 * 1024 * 1024 + 1] {
+            let data = vec![0xABu8; len];
+            let blob = seal_padded(&hkdf_kd(), None, Some(&master), &data, padding);
+
+            let mut collected = Vec::new();
+            let trailer = read_container(
+                Cursor::new(blob),
+                None,
+                Some(&master),
+                PayloadType::File,
+                b"",
+                |chunk| {
+                    collected.extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(collected, data, "len {len} did not round-trip");
+            assert_eq!(trailer.size, len as u64);
+        }
+    }
+
+    #[test]
+    fn padded_chunk_lengths_reveal_only_the_bucket() {
+        let master = Key::generate();
+        // 1 byte and 4095 bytes share the 4 KiB bucket, so their padded
+        // containers must have exactly the same length.
+        let tiny = seal_padded(&hkdf_kd(), None, Some(&master), b"x", Padding::Adaptive);
+        let almost = seal_padded(
+            &hkdf_kd(),
+            None,
+            Some(&master),
+            &vec![0u8; 4095],
+            Padding::Adaptive,
+        );
+        assert_eq!(tiny.len(), almost.len());
+
+        // A payload one byte over the bucket moves to the next one.
+        let over = seal_padded(
+            &hkdf_kd(),
+            None,
+            Some(&master),
+            &vec![0u8; 4097],
+            Padding::Adaptive,
+        );
+        assert!(over.len() > tiny.len());
+    }
+
+    #[test]
+    fn padding_requires_a_known_source_length() {
+        let master = Key::generate();
+        let mut src = Cursor::new(b"data".to_vec());
+        let mut out = Vec::new();
+        let err = write_container(
+            &mut out,
+            &hkdf_kd(),
+            None,
+            Some(&master),
+            PayloadType::File,
+            b"",
+            Some(&mut src),
+            None,
+            Padding::Adaptive,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Operation(_)));
+    }
+
+    #[test]
+    fn padding_is_rejected_for_non_file_payloads() {
+        let master = Key::generate();
+        let mut src = Cursor::new(b"data".to_vec());
+        let mut out = Vec::new();
+        let err = write_container(
+            &mut out,
+            &hkdf_kd(),
+            None,
+            Some(&master),
+            PayloadType::Manifest,
+            b"",
+            Some(&mut src),
+            None,
+            Padding::Adaptive,
+            Some(4),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Operation(_)));
+    }
+
+    #[test]
+    fn tampered_padding_header_is_rejected() {
+        let master = Key::generate();
+        let blob = seal_padded(
+            &hkdf_kd(),
+            None,
+            Some(&master),
+            b"secret",
+            Padding::Adaptive,
+        );
+        // The prelude sits directly after the 11-byte fixed header plus the
+        // HKDF object salt; flip a byte in its authenticated payload.
+        let mut corrupt = blob;
+        let pos = 11 + SALT_LEN + 4 + 8;
+        corrupt[pos] ^= 0x01;
+        assert!(read_container(
+            Cursor::new(corrupt),
+            None,
+            Some(&master),
+            PayloadType::File,
+            b"",
+            |_| Ok(())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v1_containers_are_still_readable() {
+        // `seal` writes envelope v1; the reader must accept both versions.
+        let master = Key::generate();
+        let blob = seal(
+            &hkdf_kd(),
+            None,
+            Some(&master),
+            b"legacy",
+            PayloadType::File,
+        );
+        assert_eq!(u16::from_le_bytes([blob[8], blob[9]]), ENVELOPE_VERSION);
+        let t = unseal(&blob, None, Some(&master), PayloadType::File);
+        assert_eq!(t.size, 6);
     }
 }

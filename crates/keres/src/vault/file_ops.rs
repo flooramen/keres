@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::container::{self, KeyDerivation, PayloadType};
 use crate::crypto::{self, Key};
 use crate::error::Result;
+use crate::padding::Padding;
 use crate::vault::manifest::EntryMetadata;
 
 /// Deterministic storage location for an entry's ciphertext.
@@ -38,22 +39,28 @@ pub(crate) fn blob_path(vault_dir: &Path, master: &Key, entry_id: &str) -> PathB
 /// Blobs are written via temp file + rename so a crash cannot leave a
 /// half-written entry that the manifest would still reference. Directory
 /// placeholders carry no chunks — their trailer alone asserts emptiness.
+///
+/// `padding` is applied to file payloads only; directory placeholders are
+/// always unpadded. The exact source length is captured before reading so
+/// padded containers can zero-fill up to their bucket.
 pub(crate) fn write_entry(
     vault_dir: &Path,
     master: &Key,
     entry_id: &str,
     meta: &EntryMetadata,
     source: Option<&Path>,
+    padding: Padding,
 ) -> Result<PathBuf> {
     let mut src_file;
-    let src: Option<&mut dyn Read> = match source {
+    let (src, source_len): (Option<&mut dyn Read>, Option<u64>) = match source {
         Some(p) => {
+            let len = std::fs::metadata(p)?.len();
             src_file = File::open(p)?;
-            Some(&mut src_file)
+            (Some(&mut src_file), Some(len))
         }
-        None => None,
+        None => (None, None),
     };
-    write_entry_from_reader(vault_dir, master, entry_id, meta, src)
+    write_entry_from_reader(vault_dir, master, entry_id, meta, src, padding, source_len)
 }
 
 /// Encrypts an entry from an arbitrary reader into a new-format blob.
@@ -62,13 +69,28 @@ pub(crate) fn write_entry(
 /// chunk-less directory placeholder. The output is written via temp file +
 /// rename, so a crash can never leave a half-written entry that the manifest
 /// references.
+///
+/// When `padding` is not [`Padding::None`], `source_len` must be the exact
+/// number of plaintext bytes `source` will yield.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_entry_from_reader(
     vault_dir: &Path,
     master: &Key,
     entry_id: &str,
     meta: &EntryMetadata,
     source: Option<&mut dyn Read>,
+    padding: Padding,
+    source_len: Option<u64>,
 ) -> Result<PathBuf> {
+    // Directory placeholders have no plaintext to pad; a stray policy must
+    // not turn a metadata-only entry into an error.
+    let padding = if meta.is_directory {
+        Padding::None
+    } else {
+        padding
+    };
+    padding.validate()?;
+
     let target = blob_path(vault_dir, master, entry_id);
     if let Some(parent) = target.parent() {
         crate::fsutil::create_private_dir(parent)?;
@@ -97,6 +119,8 @@ pub(crate) fn write_entry_from_reader(
                 entry_id.as_bytes(),
                 source,
                 None,
+                padding,
+                source_len,
             )?;
             w.flush()?;
         }

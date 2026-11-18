@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 use crate::crypto::Key;
 use crate::error::{Error, Result};
 use crate::fsutil;
+use crate::padding::Padding;
 use crate::vault::index_log;
 use crate::vault::keystore::VaultConfig;
 use crate::vault::manifest::{self, EntryMetadata, ManifestMap};
@@ -82,7 +83,7 @@ pub(crate) fn run(
     new_config: &VaultConfig,
     discarded_keyslots: usize,
 ) -> Result<RotationReport> {
-    let old_files = manifest::load(vault_dir, old_master)?;
+    let (old_files, padding) = manifest::load_with_padding(vault_dir, old_master)?;
 
     let mut new_files = ManifestMap::new();
     let mut report = RotationReport {
@@ -95,10 +96,18 @@ pub(crate) fn run(
         if old.is_directory {
             // Authenticate the placeholder before replacing it.
             blobs::read_entry(vault_dir, old_master, &old.id, true, |_| Ok(()))?;
-            blobs::write_entry_from_reader(vault_dir, new_master, &old.id, &meta, None)?;
+            blobs::write_entry_from_reader(
+                vault_dir,
+                new_master,
+                &old.id,
+                &meta,
+                None,
+                Padding::None,
+                None,
+            )?;
             meta.original_size = 0;
         } else {
-            let size = copy_file(vault_dir, old_master, new_master, &old.id, &meta)?;
+            let size = copy_file(vault_dir, old_master, new_master, &old.id, &meta, padding)?;
             meta.original_size = size;
             report.bytes += size;
         }
@@ -106,7 +115,7 @@ pub(crate) fn run(
         new_files.insert(vault_path.clone(), meta);
     }
 
-    let manifest_blob = manifest::encode(&new_files, new_master, 1)?;
+    let manifest_blob = manifest::encode(&new_files, new_master, 1, padding)?;
     let digest = sha256_hex(&manifest_blob);
     fsutil::atomic_write(&next_manifest_path(vault_dir), &manifest_blob)?;
 
@@ -217,8 +226,10 @@ fn copy_file(
     new_master: &Key,
     entry_id: &str,
     meta: &EntryMetadata,
+    padding: Padding,
 ) -> Result<u64> {
     let (tx, rx) = mpsc::sync_channel::<Zeroizing<Vec<u8>>>(4);
+    let expected_size = meta.original_size;
 
     std::thread::scope(|scope| -> Result<u64> {
         // `move` is essential: the sender must be dropped when the producer
@@ -228,6 +239,9 @@ fn copy_file(
                 tx.send(Zeroizing::new(chunk.to_vec()))
                     .map_err(|_| Error::Operation("rotation stream cancelled".into()))
             })?;
+            if meta.original_size != expected_size {
+                return Err(Error::Authentication);
+            }
             Ok(meta.original_size)
         });
 
@@ -238,6 +252,8 @@ fn copy_file(
             entry_id,
             meta,
             Some(&mut reader),
+            padding,
+            Some(expected_size),
         );
         drop(reader);
 
@@ -415,11 +431,19 @@ mod tests {
         let mut new_files = ManifestMap::new();
         for (path, old) in &old_files {
             let mut meta = old.clone();
-            let size = copy_file(&dir, &old_master, &new_master, &old.id, &meta).unwrap();
+            let size = copy_file(
+                &dir,
+                &old_master,
+                &new_master,
+                &old.id,
+                &meta,
+                Padding::None,
+            )
+            .unwrap();
             meta.original_size = size;
             new_files.insert(path.clone(), meta);
         }
-        let blob = manifest::encode(&new_files, &new_master, 1).unwrap();
+        let blob = manifest::encode(&new_files, &new_master, 1, Padding::None).unwrap();
         fsutil::atomic_write(&next_manifest_path(&dir), &blob).unwrap();
         let journal = Journal {
             version: JOURNAL_VERSION,

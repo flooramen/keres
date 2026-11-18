@@ -100,6 +100,8 @@ mod fsutil;
 pub mod fuzz_support;
 /// Argon2id parameter types.
 pub mod kdf;
+/// Opt-in size padding policies.
+pub mod padding;
 /// Entry-name validation helpers.
 pub mod sanitize;
 /// Single-file `.krs` containers.
@@ -118,7 +120,8 @@ pub mod vault;
 pub mod prelude {
     pub use crate::crypto::Key;
     pub use crate::error::{Error, Result};
-    pub use crate::single_file::{decrypt_file, encrypt_file};
+    pub use crate::padding::Padding;
+    pub use crate::single_file::{decrypt_file, encrypt_file, encrypt_file_with_padding};
     pub use crate::streaming::{
         decrypt_stream, encrypt_stream, DecryptReader, EncryptWriter, StreamInfo, StreamOptions,
     };
@@ -129,7 +132,8 @@ pub mod prelude {
 }
 
 pub use error::{Error, Result};
-pub use single_file::{decrypt_file, encrypt_file};
+pub use padding::Padding;
+pub use single_file::{decrypt_file, encrypt_file, encrypt_file_with_padding};
 pub use streaming::{
     decrypt_stream, encrypt_stream, DecryptReader, EncryptWriter, StreamInfo, StreamOptions,
 };

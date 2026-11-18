@@ -27,6 +27,7 @@ use crate::container::{self, KeyDerivation, PayloadType};
 use crate::crypto::{self, Key};
 use crate::error::{Error, Result};
 use crate::fsutil;
+use crate::padding::Padding;
 use crate::vault::index_log::{self, LogOp};
 
 /// SHA-256 length used to bind a log to its snapshot.
@@ -73,6 +74,13 @@ struct ManifestFile {
     /// advances them normally.
     #[serde(default)]
     generation: u64,
+    /// Size-padding policy applied to newly written file blobs.
+    ///
+    /// Stored inside the authenticated snapshot so an attacker with storage
+    /// access cannot silently disable padding. Absent on older snapshots,
+    /// which means [`Padding::None`].
+    #[serde(default, skip_serializing_if = "Padding::is_none")]
+    padding: Padding,
     files: ManifestMap,
 }
 
@@ -89,6 +97,7 @@ pub(crate) fn next_path(vault_dir: &Path) -> std::path::PathBuf {
 pub(crate) struct Snapshot {
     files: ManifestMap,
     generation: u64,
+    padding: Padding,
 }
 
 /// A decoded manifest, tagged by its on-disk schema version.
@@ -102,6 +111,8 @@ pub(crate) enum ManifestContents {
         files: ManifestMap,
         /// Authenticated generation.
         generation: u64,
+        /// Authenticated size-padding policy.
+        padding: Padding,
     },
 }
 
@@ -112,6 +123,11 @@ pub(crate) enum ManifestContents {
 /// "no entries" would let the next save drop every existing record. A log that
 /// references a different snapshot or generation is likewise an error.
 pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
+    Ok(load_with_padding(vault_dir, master)?.0)
+}
+
+/// Loads the manifest together with its authenticated size-padding policy.
+pub(crate) fn load_with_padding(vault_dir: &Path, master: &Key) -> Result<(ManifestMap, Padding)> {
     let (mut snapshot, snapshot_sha256) = load_snapshot(vault_dir, master)?;
     index_log::replay(
         vault_dir,
@@ -120,7 +136,7 @@ pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
         snapshot_sha256.as_ref(),
         snapshot.generation,
     )?;
-    Ok(snapshot.files)
+    Ok((snapshot.files, snapshot.padding))
 }
 
 /// Reads and decodes the snapshot, returning its hash and generation for log
@@ -137,6 +153,7 @@ fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(Snapshot, Option<[u8
                 Snapshot {
                     files: ManifestMap::new(),
                     generation: 1,
+                    padding: Padding::None,
                 },
                 None,
             ))
@@ -167,7 +184,15 @@ pub(crate) fn decode(bytes: &[u8], master: &Key) -> Result<ManifestMap> {
 fn decode_snapshot(bytes: &[u8], master: &Key) -> Result<Snapshot> {
     match decode_contents(bytes, master)? {
         ManifestContents::V2(_) => Err(Error::MigrationRequired),
-        ManifestContents::V3 { files, generation } => Ok(Snapshot { files, generation }),
+        ManifestContents::V3 {
+            files,
+            generation,
+            padding,
+        } => Ok(Snapshot {
+            files,
+            generation,
+            padding,
+        }),
     }
 }
 
@@ -228,6 +253,7 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
             Ok(ManifestContents::V3 {
                 files: manifest.files,
                 generation: manifest.generation,
+                padding: manifest.padding,
             })
         }
         other => Err(Error::UnsupportedVersion(other)),
@@ -240,14 +266,20 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
 /// authenticated log batch, and a fresh snapshot is written when the log has
 /// accumulated enough records. A missing snapshot is written directly (new
 /// vault or legacy migration). Callers hold the exclusive vault lock.
-pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Result<()> {
+pub(crate) fn save(
+    vault_dir: &Path,
+    files: &ManifestMap,
+    master: &Key,
+    padding: Padding,
+) -> Result<()> {
+    padding.validate()?;
     let (mut snapshot, snapshot_sha256) = match load_snapshot(vault_dir, master) {
         Ok(state) => state,
         Err(Error::MigrationRequired) => {
             // The legacy index is replaced wholesale; never try to merge with
             // records that belong to another schema.
             index_log::remove_all(vault_dir)?;
-            let blob = encode(files, master, 1)?;
+            let blob = encode(files, master, 1, padding)?;
             return fsutil::atomic_write(&path(vault_dir), &blob);
         }
         Err(e) => return Err(e),
@@ -260,7 +292,7 @@ pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Resul
             return Err(Error::InvalidVault);
         }
         index_log::remove_all(vault_dir)?;
-        let blob = encode(files, master, snapshot.generation)?;
+        let blob = encode(files, master, snapshot.generation, padding)?;
         return fsutil::atomic_write(&path(vault_dir), &blob);
     };
 
@@ -272,7 +304,7 @@ pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Resul
         snapshot.generation,
     )?;
 
-    if snapshot.files == *files {
+    if snapshot.files == *files && snapshot.padding == padding {
         return Ok(());
     }
 
@@ -282,9 +314,12 @@ pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Resul
         .as_ref()
         .map_or(snapshot.generation, |info| info.generation);
 
-    if log.as_ref().is_some_and(|info| info.should_compact()) {
+    // A policy change cannot ride the mutation log: it lives only in the
+    // snapshot, so force a fresh snapshot. Routine log growth compacts too.
+    let policy_changed = snapshot.padding != padding;
+    if policy_changed || log.as_ref().is_some_and(|info| info.should_compact()) {
         let generation = generation.saturating_add(1);
-        let blob = encode(files, master, generation)?;
+        let blob = encode(files, master, generation, padding)?;
         return index_log::compact(vault_dir, &blob, generation);
     }
 
@@ -301,6 +336,31 @@ pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Resul
         &ops,
     )?;
     Ok(())
+}
+
+/// Replaces the authenticated size-padding policy.
+///
+/// The policy lives inside the snapshot, so a change rewrites it atomically
+/// and advances the generation (the append-only log cannot carry it). Callers
+/// must hold the exclusive vault lock.
+pub(crate) fn set_padding(vault_dir: &Path, master: &Key, padding: Padding) -> Result<()> {
+    padding.validate()?;
+    let (mut snapshot, snapshot_sha256) = load_snapshot(vault_dir, master)?;
+    index_log::replay(
+        vault_dir,
+        master,
+        &mut snapshot.files,
+        snapshot_sha256.as_ref(),
+        snapshot.generation,
+    )?;
+
+    if snapshot.padding == padding {
+        return Ok(());
+    }
+
+    let generation = snapshot.generation.saturating_add(1);
+    let blob = encode(&snapshot.files, master, generation, padding)?;
+    index_log::compact(vault_dir, &blob, generation)
 }
 
 /// Computes the mutation batch that turns `old` into `new`.
@@ -327,10 +387,16 @@ fn diff(old: &ManifestMap, new: &ManifestMap) -> Vec<LogOp> {
 /// Deep rotation writes the encoded bytes to a staging path before swapping
 /// them in, so the same encoder is shared with [`save`]. `generation` is
 /// stored inside the authenticated JSON.
-pub(crate) fn encode(files: &ManifestMap, master: &Key, generation: u64) -> Result<Vec<u8>> {
+pub(crate) fn encode(
+    files: &ManifestMap,
+    master: &Key,
+    generation: u64,
+    padding: Padding,
+) -> Result<Vec<u8>> {
     let manifest = ManifestFile {
         version: MANIFEST_VERSION,
         generation,
+        padding,
         files: files.clone(),
     };
     let json = Zeroizing::new(serde_json::to_vec(&manifest).map_err(|_| Error::Encryption)?);
@@ -349,6 +415,8 @@ pub(crate) fn encode(files: &ManifestMap, master: &Key, generation: u64) -> Resu
         PayloadType::Manifest,
         b"vault-manifest",
         Some(&mut src),
+        None,
+        Padding::None,
         None,
     )?;
 
@@ -389,14 +457,14 @@ mod tests {
         let master = Key::generate();
 
         let mut files = ManifestMap::new();
-        save(dir, &files, &master).unwrap();
+        save(dir, &files, &master, Padding::None).unwrap();
         let snapshot = std::fs::read(path(dir)).unwrap();
         assert!(!index_log::exists(dir));
         assert_eq!(decode_snapshot(&snapshot, &master).unwrap().generation, 1);
 
         files.insert("a".into(), meta("a"));
         files.insert("b".into(), meta("b"));
-        save(dir, &files, &master).unwrap();
+        save(dir, &files, &master, Padding::None).unwrap();
 
         // The snapshot bytes are untouched; mutations live in the log.
         assert_eq!(std::fs::read(path(dir)).unwrap(), snapshot);
@@ -405,7 +473,7 @@ mod tests {
 
         // Deletes are recorded too.
         files.remove("a");
-        save(dir, &files, &master).unwrap();
+        save(dir, &files, &master, Padding::None).unwrap();
         assert_eq!(std::fs::read(path(dir)).unwrap(), snapshot);
         assert_eq!(load(dir, &master).unwrap(), files);
     }
@@ -417,19 +485,19 @@ mod tests {
         let master = Key::generate();
 
         let mut files = ManifestMap::new();
-        save(dir, &files, &master).unwrap();
+        save(dir, &files, &master, Padding::None).unwrap();
         let original = std::fs::read(path(dir)).unwrap();
 
         for i in 0..512 {
             files.insert(format!("e{i}"), meta(&format!("e{i}")));
-            save(dir, &files, &master).unwrap();
+            save(dir, &files, &master, Padding::None).unwrap();
         }
         assert!(log_len(dir) > 200, "expected a populated log");
         assert_eq!(std::fs::read(path(dir)).unwrap(), original);
 
         // The next save reaches the record threshold and compacts.
         files.insert("after".into(), meta("after"));
-        save(dir, &files, &master).unwrap();
+        save(dir, &files, &master, Padding::None).unwrap();
 
         assert!(std::fs::read(path(dir)).unwrap() != original);
         assert!(log_len(dir) < 200, "log should restart after compaction");

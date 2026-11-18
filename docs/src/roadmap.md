@@ -99,10 +99,10 @@ property will never be accepted for a compatibility or convenience win.
   (TPM, Secure Enclave, FIDO2/hmac-secret) combined with the password
   (limitation 4). Must remain strictly optional; plain password vaults are
   the default and always supported.
-- **Size hiding (limitation 5)** — optional fixed-size padding buckets
-  for `.krs` output and/or random trailing padding before the end marker,
-  trading space for length privacy. Needs care: padding must be covered by
-  the trailer's authenticated `size`.
+- **Size hiding (limitation 5)** — *implemented (0.7.0, opt-in).* Adaptive
+  and fixed padding buckets for `.krs` output and vault blobs, covered by an
+  authenticated v2 prelude and a trailer that binds the padded length. Timing
+  coarsening, count bucketing, and ORAM remain future work.
 - **External security audit** — pay for a professional review of the
   container format, key hierarchy and implementation before calling 1.0
   production-grade. No amount of internal review substitutes for this.

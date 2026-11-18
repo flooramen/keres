@@ -154,6 +154,88 @@ pub(crate) fn write_chunks<W: Write>(
     Ok((total, count))
 }
 
+/// Encrypts exactly `padded_len` plaintext bytes from `src`, filling the tail
+/// with zeros after the source ends.
+///
+/// `expected_len` is the caller's authenticated source length. It must equal
+/// the number of real bytes read; a file that grew or shrank between `stat`
+/// and read fails the operation instead of producing a misleading container.
+///
+/// Chunk boundaries depend only on `padded_len`, never on `expected_len`: a
+/// partially-read final chunk is zero-filled to its full length before it is
+/// sealed. Without that property, the last record's length would reveal the
+/// exact plaintext size and defeat the bucket.
+///
+/// Returns `(real_plaintext_bytes, chunk_count)`.
+pub(crate) fn write_chunks_padded<W: Write>(
+    dst: &mut W,
+    src: &mut dyn Read,
+    key: &Key,
+    context: &[u8],
+    expected_len: u64,
+    padded_len: u64,
+) -> Result<(u64, u32)> {
+    debug_assert!(padded_len >= expected_len);
+    let mut buf = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
+    let mut remaining = padded_len;
+    let mut real_total: u64 = 0;
+    let mut count: u32 = 0;
+    let mut eof = false;
+
+    while remaining > 0 {
+        let want = remaining.min(CHUNK_SIZE as u64) as usize;
+        // Reset the buffer to exactly `want` plaintext bytes; the previous
+        // iteration left ciphertext behind for efficiency.
+        buf.resize(want, 0);
+        let mut filled = 0usize;
+        if !eof {
+            while filled < want {
+                let n = match src.read(&mut buf[filled..want]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // Source failed mid-stream; scrub whatever was buffered
+                        // before reporting.
+                        buf.zeroize();
+                        return Err(e.into());
+                    }
+                };
+                if n == 0 {
+                    eof = true;
+                    break;
+                }
+                filled += n;
+            }
+        }
+        // After EOF the rest of this chunk (and all later chunks) is padding.
+        buf[filled..want].fill(0);
+        seal_chunk(dst, key, context, count, &mut buf)?;
+
+        real_total += filled as u64;
+        remaining -= want as u64;
+        count = count.checked_add(1).ok_or(Error::Encryption)?;
+        if count >= MAX_CHUNK_COUNT {
+            return Err(Error::Encryption);
+        }
+    }
+
+    if !eof {
+        let mut probe = [0u8; 1];
+        if src.read(&mut probe)? != 0 {
+            return Err(Error::Operation(
+                "input changed while it was being encrypted".into(),
+            ));
+        }
+    }
+
+    if real_total != expected_len {
+        return Err(Error::Operation(
+            "input changed while it was being encrypted".into(),
+        ));
+    }
+
+    Ok((real_total, count))
+}
+
 fn chunk_nonce(index: u32) -> crypto::Nonce12 {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&(u64::from(index)).to_be_bytes());

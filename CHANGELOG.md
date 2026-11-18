@@ -28,6 +28,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and compaction advances it by one. Pre-generation snapshots read as
   generation 0. This makes snapshot/log swaps unambiguous for crash recovery;
   it is not a rollback guarantee without hardware-backed state.
+- Opt-in L2 size padding. `Padding::{None, Adaptive, Fixed}` policies round
+  file payloads up to a bucket before encryption, using a new envelope
+  version 2 with an authenticated fixed-width prelude and a trailer that
+  binds the padded length. Vault policy is stored in the authenticated
+  index snapshot (`ManifestFile.padding`), so storage attackers cannot
+  silently disable it. `Vault::init_with_padding` / `padding` / `set_padding`,
+  `encrypt_file_with_padding`, and CLI `--padding` / `padding` expose it.
+  `DecryptReader` reads padded containers; `EncryptWriter` stays unpadded.
 
 ## [Unreleased] — 0.6.0
 

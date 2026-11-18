@@ -179,6 +179,20 @@ impl Vault {
     /// # Ok::<(), keres::Error>(())
     /// ```
     pub fn init(&mut self, password: &str) -> Result<()> {
+        self.init_with_padding(password, crate::padding::Padding::None)
+    }
+
+    /// Initializes a new vault with a custom size-padding policy.
+    ///
+    /// `padding` is applied to file entries added to the vault. It is stored
+    /// inside the authenticated index, so it cannot be silently disabled by an
+    /// attacker with storage access.
+    pub fn init_with_padding(
+        &mut self,
+        password: &str,
+        padding: crate::padding::Padding,
+    ) -> Result<()> {
+        padding.validate()?;
         if self.exists() {
             return Err(Error::VaultExists);
         }
@@ -196,8 +210,33 @@ impl Vault {
         let config = self.keystore.init(password)?;
         self.write_config(&config)?;
 
-        manifest::save(&self.path, &ManifestMap::new(), self.keystore.master_key()?)?;
+        manifest::save(
+            &self.path,
+            &ManifestMap::new(),
+            self.keystore.master_key()?,
+            padding,
+        )?;
         Ok(())
+    }
+
+    /// Returns the vault's authenticated size-padding policy.
+    pub fn padding(&self) -> Result<crate::padding::Padding> {
+        let master = self.require_unlocked()?;
+        let _lock = self.lock_shared()?;
+        let (_files, padding) = manifest::load_with_padding(&self.path, &master)?;
+        Ok(padding)
+    }
+
+    /// Replaces the vault's size-padding policy.
+    ///
+    /// Existing blobs are not rewritten; the policy only affects future adds
+    /// and replaces. The change is authenticated and advances the index
+    /// generation.
+    pub fn set_padding(&mut self, padding: crate::padding::Padding) -> Result<()> {
+        padding.validate()?;
+        let master = self.require_unlocked()?;
+        let _lock = self.lock_exclusive()?;
+        manifest::set_padding(&self.path, &master, padding)
     }
 
     /// Unlocks the vault with `password`.
@@ -291,7 +330,7 @@ impl Vault {
         };
         sanitize::validate_new_name(&root_name)?;
 
-        let mut all = manifest::load(&self.path, &master)?;
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
         if all.contains_key(&root_name) {
             return Err(Error::EntryExists(root_name));
         }
@@ -299,7 +338,7 @@ impl Vault {
         // Phase 1: write every blob (index updated last, so a crash leaves at
         // worst invisible orphans).
         if source.is_dir() {
-            add_directory_tree(&self.path, &master, &source, &root_name, &mut all)?;
+            add_directory_tree(&self.path, &master, &source, &root_name, &mut all, padding)?;
         } else {
             let id = new_entry_id();
             let meta = EntryMetadata {
@@ -309,12 +348,12 @@ impl Vault {
                 is_directory: false,
                 children: None,
             };
-            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source))?;
+            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
             all.insert(root_name.clone(), meta);
         }
 
         // Phase 2: commit index atomically.
-        manifest::save(&self.path, &all, &master)?;
+        manifest::save(&self.path, &all, &master, padding)?;
         Ok(())
     }
 
@@ -343,7 +382,7 @@ impl Vault {
             return Err(Error::invalid_name(source.display()));
         }
 
-        let mut all = manifest::load(&self.path, &master)?;
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
         let existing = all
             .get(name)
             .ok_or_else(|| Error::EntryNotFound(preview(name)))?;
@@ -361,9 +400,9 @@ impl Vault {
             is_directory: false,
             children: None,
         };
-        blobs::write_entry(&self.path, &master, &id, &meta, Some(&source))?;
+        blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
         all.insert(name.to_string(), meta);
-        manifest::save(&self.path, &all, &master)?;
+        manifest::save(&self.path, &all, &master, padding)?;
         Ok(())
     }
 
@@ -388,7 +427,7 @@ impl Vault {
             return Ok(());
         }
 
-        let mut all = manifest::load(&self.path, &master)?;
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
         let original = all
             .get(from)
             .cloned()
@@ -435,7 +474,7 @@ impl Vault {
             all.insert(new_path, meta);
         }
 
-        manifest::save(&self.path, &all, &master)?;
+        manifest::save(&self.path, &all, &master, padding)?;
         Ok(())
     }
 
@@ -447,13 +486,13 @@ impl Vault {
         let _lock = self.lock_exclusive()?;
         sanitize::validate_new_name(name)?;
 
-        let mut all = manifest::load(&self.path, &master)?;
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
         if !all.contains_key(name) {
             return Err(Error::EntryNotFound(preview(name)));
         }
 
         remove_subtree(&self.path, &master, name, &mut all);
-        manifest::save(&self.path, &all, &master)?;
+        manifest::save(&self.path, &all, &master, padding)?;
         Ok(())
     }
 
@@ -916,6 +955,7 @@ fn add_directory_tree(
     source_root: &Path,
     vault_name: &str,
     all: &mut ManifestMap,
+    padding: crate::padding::Padding,
 ) -> Result<()> {
     use walkdir::WalkDir;
 
@@ -978,7 +1018,7 @@ fn add_directory_tree(
                 is_directory: false,
                 children: None,
             };
-            blobs::write_entry(vault_dir, master, &id, &meta, Some(entry.path()))?;
+            blobs::write_entry(vault_dir, master, &id, &meta, Some(entry.path()), padding)?;
             all.insert(full.clone(), meta);
         }
 
@@ -992,7 +1032,14 @@ fn add_directory_tree(
     // Persist directory placeholder blobs (only the ones from this call).
     for dir_path in &dir_paths {
         if let Some(meta) = all.get(dir_path) {
-            blobs::write_entry(vault_dir, master, &meta.id, meta, None)?;
+            blobs::write_entry(
+                vault_dir,
+                master,
+                &meta.id,
+                meta,
+                None,
+                crate::padding::Padding::None,
+            )?;
         }
     }
     Ok(())

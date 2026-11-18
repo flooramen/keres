@@ -41,12 +41,14 @@ matters most for the monorepo.
       crash recovery, and automatic journal recovery on lock acquisition.
 - [x] Internal index generations: authenticated in the snapshot, matched by
       the log, advanced by compaction, with crash-phase recovery tests.
-- [ ] Size padding to buckets and operation-count bucketing (L2+).
+- [x] Opt-in L2 size padding: adaptive/fixed buckets, padded v2 containers,
+      vault policy in the authenticated index, CLI `--padding`/`padding`.
+- [ ] Operation-count bucketing (L2+).
 - [ ] Parallel chunk pipeline.
 
 ## Later
 
-- [ ] Optional size-hiding padding buckets.
+- [x] Optional size-hiding padding buckets (opt-in, adaptive/fixed).
 - [ ] Snapshot/version history and restore.
 - [ ] Hardware-backed keys (TPM, Secure Enclave, FIDO2).
 - [ ] External security audit and a 1.0 release.

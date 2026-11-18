@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
+use keres::padding::Padding;
 use keres::prelude::*;
-
 use keres::Vault;
 
 fn vault_root() -> Result<PathBuf> {
@@ -102,6 +102,9 @@ enum Commands {
     Init {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
         vault: String,
+        /// Size-padding policy (none, adaptive, or a fixed bucket like 65536).
+        #[arg(long, default_value = "none")]
+        padding: String,
     },
     /// Add a file or folder to the vault.
     Add {
@@ -183,6 +186,14 @@ enum Commands {
         #[arg(long)]
         prune: bool,
     },
+    /// Show or change the vault's size-padding policy.
+    Padding {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Set the policy (none, adaptive, or a fixed bucket like 65536).
+        #[arg(long)]
+        set: Option<String>,
+    },
     /// Upgrade a vault written by an older release (0.5.x) to the current format.
     Migrate {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
@@ -210,6 +221,9 @@ enum Commands {
         /// Overwrite the output if it already exists.
         #[arg(short, long)]
         force: bool,
+        /// Size-padding policy (none, adaptive, or a fixed bucket like 65536).
+        #[arg(long, default_value = "none")]
+        padding: String,
     },
     /// Decrypt a single file.
     Decrypt {
@@ -416,6 +430,19 @@ fn print_report(report: &IntegrityReport) {
     }
 }
 
+fn parse_padding(value: &str) -> Result<Padding> {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Ok(Padding::None),
+        "adaptive" => Ok(Padding::Adaptive),
+        other => {
+            let size: u64 = other
+                .parse()
+                .map_err(|_| Error::Operation(format!("unknown padding policy: {value}")))?;
+            Padding::fixed(size)
+        }
+    }
+}
 fn main() {
     let cli = Cli::parse();
     let passwords = PasswordSource {
@@ -430,14 +457,15 @@ fn main() {
 
 fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
     match command {
-        Commands::Init { vault } => {
+        Commands::Init { vault, padding } => {
             let path = new_vault_path(&vault)?;
             let password = passwords.read("Enter vault password")?;
             let confirm = passwords.read("Confirm password")?;
             if password.as_str() != confirm.as_str() {
                 return Err(Error::Operation("passwords don't match".into()));
             }
-            Vault::new(path.clone()).init(password.as_str())?;
+            let padding = parse_padding(&padding)?;
+            Vault::new(path.clone()).init_with_padding(password.as_str(), padding)?;
             println!("Vault '{}' created at {}", vault, path.display());
         }
         Commands::Add { vault, path, name } => {
@@ -649,6 +677,20 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
                 println!("Pruned {removed} orphaned file(s)");
             }
         }
+        Commands::Padding { vault, set } => {
+            let dir = existing_vault_path(&vault)?;
+            let password = passwords.read("Enter vault password")?;
+            let mut v = Vault::new(dir);
+            v.unlock(password.as_str())?;
+            if let Some(value) = set {
+                let padding = parse_padding(&value)?;
+                v.set_padding(padding)?;
+                println!("Padding policy set to {}", padding);
+            } else {
+                let padding = v.padding()?;
+                println!("Padding policy: {}", padding);
+            }
+        }
         Commands::Migrate { vault, force } => {
             let dir = existing_vault_path(&vault)?;
             if !force
@@ -709,12 +751,23 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
             input,
             output,
             force,
+            padding,
         } => {
             if let Some(out) = &output {
                 refuse_overwrite(out, force)?;
             }
             let password = passwords.read("Enter encryption password")?;
-            let out_path = keres::encrypt_file(password.as_str(), &input, output.as_deref())?;
+            let padding = parse_padding(&padding)?;
+            let out_path = if padding.is_none() {
+                keres::encrypt_file(password.as_str(), &input, output.as_deref())?
+            } else {
+                keres::encrypt_file_with_padding(
+                    password.as_str(),
+                    &input,
+                    output.as_deref(),
+                    padding,
+                )?
+            };
             println!("Encrypted to: {}", out_path.display());
         }
         Commands::Decrypt {

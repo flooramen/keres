@@ -163,8 +163,8 @@ impl<'a, W: Write> EncryptWriter<'a, W> {
     ) -> Result<Self> {
         let kd = container::password_key_derivation();
         let key = kd.content_key(Some(password), None, b"")?;
-        let context = PayloadType::File.context();
-        kd.write_header(&mut inner)?;
+        let context = PayloadType::File.context(container::ENVELOPE_VERSION)?;
+        kd.write_header(&mut inner, container::ENVELOPE_VERSION)?;
 
         Ok(Self {
             inner,
@@ -225,6 +225,7 @@ impl<'a, W: Write> EncryptWriter<'a, W> {
             &mut self.inner,
             &self.key,
             PayloadType::File,
+            container::ENVELOPE_VERSION,
             self.original_name.as_deref(),
             self.total,
             self.count,
@@ -285,6 +286,13 @@ pub struct DecryptReader<'a, R: Read> {
     inner: R,
     key: Key,
     context: Vec<u8>,
+    version: u16,
+    /// Padded plaintext length from the v2 prelude, or `None` for v1.
+    padded_size: Option<u64>,
+    /// Real plaintext bytes still owed to the caller (padded streams only).
+    remaining: Option<u64>,
+    /// Total chunk plaintext observed, including padding.
+    padded_read: u64,
     pending: Zeroizing<Vec<u8>>,
     pos: usize,
     count: u32,
@@ -302,12 +310,28 @@ impl<'a, R: Read> DecryptReader<'a, R> {
 
     /// Like [`DecryptReader::new`], with progress and cancellation.
     pub fn with_options(password: &str, mut inner: R, options: StreamOptions<'a>) -> Result<Self> {
-        let kd = container::read_header(&mut inner)?;
-        let key = kd.content_key(Some(password), None, b"")?;
+        let header = container::read_header(&mut inner)?;
+        let version = header.version;
+        let key = header.kd.content_key(Some(password), None, b"")?;
+        let context = PayloadType::File.context(version)?;
+
+        // Padded (envelope v2) containers start with an authenticated prelude
+        // that tells us the real size before any chunk is yielded.
+        let (padded_size, remaining) = if version == container::ENVELOPE_VERSION_PADDED {
+            let padding = container::read_padding_header(&mut inner, &key)?;
+            (Some(padding.padded_size), Some(padding.size))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             inner,
             key,
-            context: PayloadType::File.context(),
+            context,
+            version,
+            padded_size,
+            remaining,
+            padded_read: 0,
             pending: Zeroizing::new(Vec::new()),
             pos: 0,
             count: 0,
@@ -347,15 +371,32 @@ impl<'a, R: Read> DecryptReader<'a, R> {
 
             self.options.check_cancel()?;
             match stream::read_chunk(&mut self.inner, &self.key, &self.context, self.count)? {
-                Some(chunk) => {
+                Some(mut chunk) => {
                     self.count += 1;
                     if self.count >= stream::MAX_CHUNK_COUNT {
                         return Err(Error::InvalidHeader);
                     }
-                    self.total += chunk.len() as u64;
+                    self.padded_read += chunk.len() as u64;
+
+                    // For a padded stream, only the first `remaining` bytes of
+                    // the chunk section are real; the rest is zero padding.
+                    let take = match self.remaining.as_mut() {
+                        Some(left) => {
+                            let take = (*left).min(chunk.len() as u64) as usize;
+                            *left -= take as u64;
+                            take
+                        }
+                        None => chunk.len(),
+                    };
+                    if take < chunk.len() {
+                        chunk.truncate(take);
+                    }
+                    self.total += take as u64;
                     self.pending = chunk;
                     self.pos = 0;
-                    self.options.progress(self.total);
+                    if take > 0 {
+                        self.options.progress(self.total);
+                    }
                 }
                 None => {
                     self.verify_trailer()?;
@@ -393,9 +434,19 @@ impl<'a, R: Read> DecryptReader<'a, R> {
     }
 
     fn verify_trailer(&mut self) -> Result<()> {
-        let trailer = container::read_trailer(&mut self.inner, &self.key, PayloadType::File)?;
-        if trailer.size != self.total || trailer.chunk_count != self.count {
+        let trailer =
+            container::read_trailer(&mut self.inner, &self.key, PayloadType::File, self.version)?;
+
+        // The v2 trailer binds the padded length and chunk count; the real
+        // size lives in the authenticated prelude.
+        let expected_size = self.padded_size.unwrap_or(self.total);
+        if trailer.size != expected_size || trailer.chunk_count != self.count {
             return Err(Error::Authentication);
+        }
+        if let Some(padded) = self.padded_size {
+            if self.padded_read != padded || self.remaining != Some(0) {
+                return Err(Error::Authentication);
+            }
         }
         container::ensure_eof(&mut self.inner)?;
         self.original_name = trailer.name;

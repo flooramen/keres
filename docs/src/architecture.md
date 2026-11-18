@@ -555,3 +555,50 @@ Deliberate policy: callers cannot distinguish "wrong password" from
 messages into a tamper oracle.
 
 ---
+
+---
+
+## Size padding (opt-in, envelope v2)
+
+By default a container's ciphertext length tracks its plaintext length
+exactly. That leaks the file size to anyone who can measure the storage
+medium. Opt-in padding rounds the plaintext up to a bucket before
+encryption, so an observer learns only the bucket.
+
+Padding is selected per container:
+
+- `.krs`: `Padding` passed to `encrypt_file_with_padding` (CLI: `--padding`).
+- Vault: `Padding` stored in the authenticated index snapshot
+  (`ManifestFile.padding`, default `None`), so a storage attacker cannot
+  silently disable it. `Vault::padding` / `set_padding` expose it.
+- Manifests and directory placeholders are always unpadded.
+
+When padding is not `None`, the container uses **envelope version 2**. The
+wire layout gains one authenticated fixed-width (25 byte) record after the
+header and before the chunk section:
+
+```
+8 real size (BE) ‖ 8 padded size (BE) ‖ 1 mode ‖ 8 fixed bucket (BE)
+```
+
+sealed under nonce `[0xFE; 12]` with AAD `keres-container-v2/padding`.
+
+The chunk section then contains exactly `padded_size` plaintext bytes: the
+real bytes followed by zero-filled padding. Chunk boundaries depend only on
+`padded_size`, so the last record's length reveals only the bucket. The
+trailer's `size` field binds the **padded** length (never the real size),
+so its variable-length JSON does not leak the number of digits in the real
+size. On read, the reader trims to the real size from the prelude and
+normalizes `trailer.size` to it before returning.
+
+Policies (`Padding`):
+
+- `None` — no padding (default, compact format).
+- `Adaptive` — next power of two, clamped to `[4 KiB, 16 MiB]`; larger
+  payloads round to the next multiple of 16 MiB.
+- `Fixed { size }` — next multiple of `size`, which must lie in the same
+  range.
+
+`DecryptReader` supports v2 containers and yields only real plaintext.
+`EncryptWriter` remains unpadded because it cannot know the total length
+upfront.

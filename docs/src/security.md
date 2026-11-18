@@ -173,15 +173,17 @@ ids and the slot count are plaintext metadata in `vault.config`.
    Keres containers.
 4. **Single-factor** — no hardware-token or multi-party key splitting.
 5. **Filename leakage via size** — plaintext lengths are visible through
-   ciphertext length (chunked at 64 KiB granularity).
+   ciphertext length *unless* size padding is enabled, in which case only
+   the bucket is revealed. Padding is opt-in (`Vault::padding` / `set_padding`,
+   `encrypt_file_with_padding` / CLI `--padding`); L1 remains the default.
 6. **Trust on first unlock** — the config stores a verification hash rather
    than a signature; there is no protection against full-storage rollback to
    an older valid vault snapshot. Truncating the tail of the index log is
    likewise indistinguishable from an interrupted append.
 7. **Operation-pattern leakage** — the index log's record count, size, and
    approximate write order reveal how many mutations happened and roughly
-   when. Entry sizes are not padded to buckets yet; access patterns are not
-   hidden.
+   when. Entry sizes may be bucketed when padding is enabled, but access
+   patterns and exact counts are not hidden.
 
 ## Reporting
 

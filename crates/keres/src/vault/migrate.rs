@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 use crate::container::{self, PayloadType};
 use crate::crypto::Key;
 use crate::error::{Error, Result};
+use crate::padding::Padding;
 use crate::sanitize;
 
 use super::file_ops as blobs;
@@ -68,7 +69,15 @@ pub(crate) fn run(vault_dir: &Path, master: &Key) -> Result<MigrationReport> {
         if old.is_directory {
             // Authenticate the placeholder before replacing it.
             read_legacy_entry(vault_dir, master, path, true, |_| Ok(()))?;
-            blobs::write_entry_from_reader(vault_dir, master, &meta.id, &meta, None)?;
+            blobs::write_entry_from_reader(
+                vault_dir,
+                master,
+                &meta.id,
+                &meta,
+                None,
+                Padding::None,
+                None,
+            )?;
             meta.original_size = 0;
         } else {
             let size = copy_file(vault_dir, master, path, &meta)?;
@@ -82,7 +91,7 @@ pub(crate) fn run(vault_dir: &Path, master: &Key) -> Result<MigrationReport> {
 
     // Cut-over point: every new blob exists, so replacing the manifest makes
     // the upgrade visible atomically (temp file + rename).
-    manifest::save(vault_dir, &upgraded, master)?;
+    manifest::save(vault_dir, &upgraded, master, Padding::None)?;
 
     // Legacy blobs are unreachable now. Best-effort removal matches normal
     // `remove`; anything left behind is an orphan for `prune_orphans`.
@@ -116,8 +125,15 @@ fn copy_file(
         });
 
         let mut reader = ChannelReader::new(rx);
-        let write =
-            blobs::write_entry_from_reader(vault_dir, master, &meta.id, meta, Some(&mut reader));
+        let write = blobs::write_entry_from_reader(
+            vault_dir,
+            master,
+            &meta.id,
+            meta,
+            Some(&mut reader),
+            Padding::None,
+            None,
+        );
         // Close the receiving end before joining: if the write failed, the
         // producer may be blocked on a full channel and must see a disconnect.
         drop(reader);
@@ -291,6 +307,8 @@ mod tests {
             b"vault-manifest",
             Some(&mut Cursor::new(plaintext)),
             None,
+            Padding::None,
+            None,
         )
         .unwrap();
         crate::fsutil::atomic_write(&dir.join("d").join(".manifest.enc"), &bytes).unwrap();
@@ -314,6 +332,8 @@ mod tests {
             typ,
             path.as_bytes(),
             src.as_mut().map(|c| c as &mut dyn Read),
+            None,
+            Padding::None,
             None,
         )
         .unwrap();
