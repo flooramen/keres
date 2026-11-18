@@ -185,8 +185,34 @@ ids and the slot count are plaintext metadata in `vault.config`.
    when. Entry sizes may be bucketed when padding is enabled, but access
    patterns and exact counts are not hidden.
 
-## Reporting
+## Metadata leakage matrix
 
-Please report vulnerabilities privately to the maintainers instead opening a
-public issue.
+What a storage-level observer (someone who can read the vault directory and
+measure file sizes and mtimes, but not decrypt) can learn, and which
+mitigations apply. "L1" is the default; "L2+" requires opt-in padding and
+the caveats below.
+
+| Signal | L1 (default) | L2+ (opt-in padding) | Notes |
+|---|---|---|---|
+| Container magic / format existence | Visible | Visible | Keres magic is not hidden; deniability is out of scope. |
+| Vault existence | Visible | Visible | Directory layout identifies a vault. |
+| Number of top-level entries | Visible | Visible (coarse) | Manifest size hints at count; count bucketing is deferred. |
+| Entry sizes | Exact (64 KiB granularity) | Bucket only | Requires `Padding != None`; manifests/dirs unpadded. |
+| File names | Hidden | Hidden | Always encrypted in the index. |
+| Directory structure | Hidden | Hidden | Encrypted in the index. |
+| Access patterns (read/write order, frequency) | Visible | Visible | Not hidden; needs ORAM (out of scope). |
+| Modification times | OS-level (visible) | OS-level (visible) | Not coarsened. |
+| Index mutation count / order | Visible via log size | Visible via log size | Group commit (timing coarsening) is future work. |
+| Deleted-entry recoverability | Blob removed on `remove` | Blob removed; old copies decryptable unless `erase` | `erase` rotates the master key. |
+| Rollback to older snapshot | Possible (no signatures) | Possible | Hardware-backed counter is optional/future. |
+
+### Caveats
+
+- Padding hides the exact size, not the access pattern. An observer who sees
+  *which* blob is read still learns which entry was used.
+- `remove` drops the blob and index record but leaves the data decryptable by
+  anyone holding an old master key or snapshot. Use `Vault::erase` (or
+  `Vault::rotate` after removal) to invalidate that key material.
+- Group commit and timing jitter are not yet implemented; mutations are
+  flushed per save.
 

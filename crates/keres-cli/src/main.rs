@@ -194,6 +194,16 @@ enum Commands {
         #[arg(long)]
         set: Option<String>,
     },
+    /// Remove an entry and rotate the master key (crypto-erasure).
+    Erase {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Name of the file/folder to erase.
+        name: String,
+        /// Erase without an interactive confirmation.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Upgrade a vault written by an older release (0.5.x) to the current format.
     Migrate {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
@@ -690,6 +700,37 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
                 let padding = v.padding()?;
                 println!("Padding policy: {}", padding);
             }
+        }
+        Commands::Erase { vault, name, force } => {
+            let dir = existing_vault_path(&vault)?;
+            if !force
+                && !confirm(&format!(
+                    "Erase '{name}' from vault '{vault}'? This re-encrypts every other entry under a fresh master key."
+                ))?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let password = passwords.read("Enter vault password")?;
+            let new_password = passwords.read("New password after erase")?;
+            let confirm_pw = passwords.read("Confirm new password")?;
+            if new_password.as_str() != confirm_pw.as_str() {
+                return Err(Error::Operation("passwords don't match".into()));
+            }
+            let mut v = Vault::new(dir);
+            v.unlock(password.as_str())?;
+            let report = v.erase(&name, new_password.as_str())?;
+            println!(
+                "Erased '{}': re-encrypted {} {} ({}).",
+                name,
+                report.entries,
+                if report.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                format_size(report.bytes)
+            );
         }
         Commands::Migrate { vault, force } => {
             let dir = existing_vault_path(&vault)?;

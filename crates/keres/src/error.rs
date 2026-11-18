@@ -87,6 +87,11 @@ pub enum Error {
     #[error("entry already exists: {0}")]
     EntryExists(String),
 
+    /// A conditional write's precondition did not hold (if-match/if-none-match
+    /// failed). The vault was not modified.
+    #[error("precondition failed: vault state changed")]
+    Conflict,
+
     /// Serialization/deserialization of an encrypted structure failed after
     /// successful decryption.
     #[error("malformed decrypted payload")]

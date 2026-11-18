@@ -36,6 +36,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   silently disable it. `Vault::init_with_padding` / `padding` / `set_padding`,
   `encrypt_file_with_padding`, and CLI `--padding` / `padding` expose it.
   `DecryptReader` reads padded containers; `EncryptWriter` stays unpadded.
+- Conditional writes and explicit batch commit. `Vault::version()` exposes an
+  authenticated index version (generation + record count); `add_if` /
+  `replace_if` apply a mutation only when the captured version still matches
+  (if-match), and `add_if` also refuses to overwrite an existing entry
+  (if-none-match), returning `WriteOutcome`. `Vault::apply_batch` commits
+  several adds/replaces/removals in a single index commit. New
+  `Error::Conflict` reports a failed precondition.
+- Crypto-erasure. `Vault::erase` removes an entry and then rotates the master
+  key (re-encrypting survivors) so captured copies of the deleted blob become
+  undecryptable; the vault ends up locked under the new password. Ordinary
+  `remove` documents that copies remain readable by holders of an old master
+  key. CLI `erase` command added. Metadata-leakage matrix published in
+  `docs/src/security.md`.
 
 ## [Unreleased] — 0.6.0
 

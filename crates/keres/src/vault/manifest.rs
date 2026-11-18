@@ -139,6 +139,20 @@ pub(crate) fn load_with_padding(vault_dir: &Path, master: &Key) -> Result<(Manif
     Ok((snapshot.files, snapshot.padding))
 }
 
+/// Returns the current authenticated index version (generation + record count).
+pub(crate) fn current_version(vault_dir: &Path, master: &Key) -> Result<(u64, u64)> {
+    let (mut snapshot, snapshot_sha256) = load_snapshot(vault_dir, master)?;
+    let log = index_log::replay(
+        vault_dir,
+        master,
+        &mut snapshot.files,
+        snapshot_sha256.as_ref(),
+        snapshot.generation,
+    )?;
+    let records = log.map(|info| info.next_index).unwrap_or(0);
+    Ok((snapshot.generation, records))
+}
+
 /// Reads and decodes the snapshot, returning its hash and generation for log
 /// binding.
 ///

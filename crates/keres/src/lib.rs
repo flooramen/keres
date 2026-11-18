@@ -126,8 +126,8 @@ pub mod prelude {
         decrypt_stream, encrypt_stream, DecryptReader, EncryptWriter, StreamInfo, StreamOptions,
     };
     pub use crate::vault::{
-        EntryInfo, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, RotationReport,
-        Vault,
+        BatchOp, EntryInfo, IndexVersion, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, RotationReport,
+        Vault, WriteOutcome,
     };
 }
 
@@ -138,7 +138,8 @@ pub use streaming::{
     decrypt_stream, encrypt_stream, DecryptReader, EncryptWriter, StreamInfo, StreamOptions,
 };
 pub use vault::{
-    EntryInfo, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, RotationReport, Vault,
+    BatchOp, EntryInfo, IndexVersion, IntegrityReport, KeyslotInfo, MigrationReport, RecoveryCode, RotationReport,
+    Vault, WriteOutcome,
 };
 
 /// Crate version, handy for CLI `--version` output.

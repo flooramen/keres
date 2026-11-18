@@ -105,6 +105,56 @@ impl std::fmt::Debug for Vault {
     }
 }
 
+/// One mutation in an explicit batch commit.
+#[derive(Debug)]
+pub enum BatchOp {
+    /// Add a file or directory tree under `name` (defaults to source basename).
+    Add {
+        /// Filesystem source.
+        source: PathBuf,
+        /// Vault name; `None` uses the source basename.
+        name: Option<String>,
+    },
+    /// Replace an existing file entry's contents.
+    Replace {
+        /// New file contents.
+        source: PathBuf,
+        /// Existing entry name.
+        name: String,
+    },
+    /// Remove an entry (and its subtree).
+    Remove {
+        /// Entry name.
+        name: String,
+    },
+}
+///
+/// Captures the authenticated snapshot generation and the number of mutation
+/// records appended on top of it. Two calls that observe the same version saw
+/// identical index state, so a conditional write can compare against a value
+/// captured earlier to detect intervening mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexVersion {
+    /// Authenticated snapshot generation.
+    pub generation: u64,
+    /// Number of mutation records appended on top of that snapshot.
+    pub records: u64,
+}
+
+/// Outcome of a conditional write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The mutation was applied. Carries the new index version.
+    Applied {
+        /// Version after the mutation.
+        version: IndexVersion,
+    },
+    /// The precondition did not hold; nothing was written.
+    Conflict {
+        /// Current index version the caller should retry against.
+        current: IndexVersion,
+    },
+}
 /// One entry as returned by [`Vault::list`].
 #[derive(Debug, Clone)]
 pub struct EntryInfo {
@@ -225,6 +275,159 @@ impl Vault {
         let _lock = self.lock_shared()?;
         let (_files, padding) = manifest::load_with_padding(&self.path, &master)?;
         Ok(padding)
+    }
+
+    /// Returns the current authenticated index version.
+    ///
+    /// Useful as a precondition token for [`Vault::add_if`] /
+    /// [`Vault::replace_if`].
+    pub fn version(&self) -> Result<IndexVersion> {
+        let master = self.require_unlocked()?;
+        let _lock = self.lock_shared()?;
+        let (generation, records) = manifest::current_version(&self.path, &master)?;
+        Ok(IndexVersion {
+            generation,
+            records,
+        })
+    }
+
+    /// Adds `source` only if `expected` matches the current index version.
+    ///
+    /// `expected = None` means "apply unconditionally" (still reports the
+    /// resulting version). Returns [`WriteOutcome::Conflict`] when the vault
+    /// changed since `expected` was captured, or when an entry named
+    /// `root_name` already exists (if-none-match). Nothing is written on
+    /// conflict.
+    pub fn add_if(
+        &mut self,
+        source: &Path,
+        name: Option<&str>,
+        expected: Option<IndexVersion>,
+    ) -> Result<WriteOutcome> {
+        let master = self.require_unlocked()?;
+        let _lock = self.lock_exclusive()?;
+
+        let source = source
+            .canonicalize()
+            .map_err(|_| Error::invalid_name(source.display()))?;
+        if !source.is_file() && !source.is_dir() {
+            return Err(Error::invalid_name(source.display()));
+        }
+
+        let root_name = match name {
+            Some(n) => n.to_string(),
+            None => source
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .ok_or_else(|| Error::invalid_name(source.display()))?,
+        };
+        sanitize::validate_new_name(&root_name)?;
+
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
+        let (gen, records) = manifest::current_version(&self.path, &master)?;
+        let current = IndexVersion {
+            generation: gen,
+            records,
+        };
+
+        if let Some(exp) = expected {
+            if exp != current {
+                return Ok(WriteOutcome::Conflict { current });
+            }
+        }
+        if all.contains_key(&root_name) {
+            return Ok(WriteOutcome::Conflict { current });
+        }
+
+        if source.is_dir() {
+            add_directory_tree(&self.path, &master, &source, &root_name, &mut all, padding)?;
+        } else {
+            let id = new_entry_id();
+            let meta = EntryMetadata {
+                id: id.clone(),
+                original_name: root_name.clone(),
+                original_size: fs::metadata(&source)?.len(),
+                is_directory: false,
+                children: None,
+            };
+            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+            all.insert(root_name.clone(), meta);
+        }
+
+        manifest::save(&self.path, &all, &master, padding)?;
+        let (gen2, records2) = manifest::current_version(&self.path, &master)?;
+        Ok(WriteOutcome::Applied {
+            version: IndexVersion {
+                generation: gen2,
+                records: records2,
+            },
+        })
+    }
+
+    /// Replaces an existing file entry only if `expected` matches the current
+    /// index version.
+    ///
+    /// `expected = None` means unconditional. Returns
+    /// [`WriteOutcome::Conflict`] when the vault changed or the entry does not
+    /// exist.
+    pub fn replace_if(
+        &mut self,
+        source: &Path,
+        name: &str,
+        expected: Option<IndexVersion>,
+    ) -> Result<WriteOutcome> {
+        let master = self.require_unlocked()?;
+        let _lock = self.lock_exclusive()?;
+        sanitize::validate_new_name(name)?;
+
+        let source = source
+            .canonicalize()
+            .map_err(|_| Error::invalid_name(source.display()))?;
+        if !source.is_file() {
+            return Err(Error::invalid_name(source.display()));
+        }
+
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
+        let (gen, records) = manifest::current_version(&self.path, &master)?;
+        let current = IndexVersion {
+            generation: gen,
+            records,
+        };
+
+        if let Some(exp) = expected {
+            if exp != current {
+                return Ok(WriteOutcome::Conflict { current });
+            }
+        }
+
+        let existing = match all.get(name) {
+            Some(e) => e.clone(),
+            None => return Ok(WriteOutcome::Conflict { current }),
+        };
+        if existing.is_directory {
+            return Err(Error::Operation(
+                "cannot replace a directory entry; remove it first".into(),
+            ));
+        }
+        let id = existing.id.clone();
+
+        let meta = EntryMetadata {
+            id: id.clone(),
+            original_name: name.to_string(),
+            original_size: fs::metadata(&source)?.len(),
+            is_directory: false,
+            children: None,
+        };
+        blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+        all.insert(name.to_string(), meta);
+        manifest::save(&self.path, &all, &master, padding)?;
+        let (gen2, records2) = manifest::current_version(&self.path, &master)?;
+        Ok(WriteOutcome::Applied {
+            version: IndexVersion {
+                generation: gen2,
+                records: records2,
+            },
+        })
     }
 
     /// Replaces the vault's size-padding policy.
@@ -481,6 +684,8 @@ impl Vault {
     /// Removes an entry (and, for directories, its whole subtree).
     ///
     /// Both the ciphertext blobs and their manifest records are deleted.
+    /// Copies of the blob made under the old master key remain decryptable
+    /// by anyone holding that key; use [`Vault::erase`] for crypto-erasure.
     pub fn remove(&mut self, name: &str) -> Result<()> {
         let master = self.require_unlocked()?;
         let _lock = self.lock_exclusive()?;
@@ -494,6 +699,48 @@ impl Vault {
         remove_subtree(&self.path, &master, name, &mut all);
         manifest::save(&self.path, &all, &master, padding)?;
         Ok(())
+    }
+
+    /// Removes an entry and then re-encrypts every survivor under a fresh
+    /// master key, so copies of the deleted entry made under the old master
+    /// can no longer be decrypted.
+    ///
+    /// This is the crypto-erasure path: ordinary [`Vault::remove`] only drops
+    /// the blob and index record, leaving the data readable by anyone who
+    /// captured the old master key or an old snapshot. `erase` pays the cost of
+    /// a full rotation to invalidate that key material. The vault ends up
+    /// locked under `new_password`; extra keyslots and any recovery kit are
+    /// dropped, as with [`Vault::rotate`].
+    pub fn erase(&mut self, name: &str, new_password: &str) -> Result<RotationReport> {
+        let old_master = self.require_unlocked()?;
+        let _lock = self.lock_exclusive()?;
+        sanitize::validate_new_name(name)?;
+
+        // Phase 1: drop the entry (blob + index record) under the old master.
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &old_master)?;
+        if !all.contains_key(name) {
+            return Err(Error::EntryNotFound(preview(name)));
+        }
+        remove_subtree(&self.path, &old_master, name, &mut all);
+        manifest::save(&self.path, &all, &old_master, padding)?;
+
+        // Phase 2: rotate the master key so the old one (which could still
+        // decrypt a captured copy of the deleted blob) is invalidated. Only
+        // survivors are re-encrypted.
+        let config = self.load_config()?;
+        let discarded = config.slot_ids().len().saturating_sub(1);
+        let new_master = Key::generate();
+        let new_config = VaultConfig::new(&new_master, new_password)?;
+        let report = rotation::run(
+            &self.path,
+            &old_master,
+            &new_master,
+            &new_config,
+            discarded,
+        )?;
+
+        self.keystore.lock();
+        Ok(report)
     }
 
     /// Lists top-level entries. Children of directories are addressed by
@@ -825,7 +1072,108 @@ impl Vault {
         Ok(report)
     }
 
-    /// Verifies every entry's blob by fully decrypting it (authenticating
+    /// Applies a batch of mutations in a single commit.
+    ///
+    /// Blobs are written first, then the index is committed once, so a
+    /// multi-entry update costs one fsync instead of one per entry. On
+    /// conflict or error nothing is committed (already-written blobs become
+    /// orphans reclaimable by [`Vault::prune_orphans`]).
+    pub fn apply_batch(&mut self, ops: &[BatchOp]) -> Result<()> {
+        let master = self.require_unlocked()?;
+        let _lock = self.lock_exclusive()?;
+
+        let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
+
+        for op in ops {
+            match op {
+                BatchOp::Add { source, name } => {
+                    let source = source
+                        .canonicalize()
+                        .map_err(|_| Error::invalid_name(source.display()))?;
+                    if !source.is_file() && !source.is_dir() {
+                        return Err(Error::invalid_name(source.display()));
+                    }
+                    let root_name = match name {
+                        Some(n) => n.clone(),
+                        None => source
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .ok_or_else(|| Error::invalid_name(source.display()))?,
+                    };
+                    sanitize::validate_new_name(&root_name)?;
+                    if all.contains_key(&root_name) {
+                        return Err(Error::EntryExists(root_name));
+                    }
+                    if source.is_dir() {
+                        add_directory_tree(
+                            &self.path,
+                            &master,
+                            &source,
+                            &root_name,
+                            &mut all,
+                            padding,
+                        )?;
+                    } else {
+                        let id = new_entry_id();
+                        let meta = EntryMetadata {
+                            id: id.clone(),
+                            original_name: root_name.clone(),
+                            original_size: fs::metadata(&source)?.len(),
+                            is_directory: false,
+                            children: None,
+                        };
+                        blobs::write_entry(
+                            &self.path,
+                            &master,
+                            &id,
+                            &meta,
+                            Some(&source),
+                            padding,
+                        )?;
+                        all.insert(root_name, meta);
+                    }
+                }
+                BatchOp::Replace { source, name } => {
+                    sanitize::validate_new_name(name)?;
+                    let source = source
+                        .canonicalize()
+                        .map_err(|_| Error::invalid_name(source.display()))?;
+                    if !source.is_file() {
+                        return Err(Error::invalid_name(source.display()));
+                    }
+                    let existing = all
+                        .get(name)
+                        .ok_or_else(|| Error::EntryNotFound(preview(name)))?
+                        .clone();
+                    if existing.is_directory {
+                        return Err(Error::Operation(
+                            "cannot replace a directory entry; remove it first".into(),
+                        ));
+                    }
+                    let id = existing.id.clone();
+                    let meta = EntryMetadata {
+                        id: id.clone(),
+                        original_name: name.clone(),
+                        original_size: fs::metadata(&source)?.len(),
+                        is_directory: false,
+                        children: None,
+                    };
+                    blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+                    all.insert(name.clone(), meta);
+                }
+                BatchOp::Remove { name } => {
+                    sanitize::validate_new_name(name)?;
+                    if !all.contains_key(name) {
+                        return Err(Error::EntryNotFound(preview(name)));
+                    }
+                    remove_subtree(&self.path, &master, name, &mut all);
+                }
+            }
+        }
+
+        manifest::save(&self.path, &all, &master, padding)?;
+        Ok(())
+    }
     /// all chunk tags), reporting missing or corrupted items.
     ///
     /// Restores the prior lock state when done.
