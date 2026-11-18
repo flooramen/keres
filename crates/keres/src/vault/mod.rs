@@ -731,13 +731,7 @@ impl Vault {
         let discarded = config.slot_ids().len().saturating_sub(1);
         let new_master = Key::generate();
         let new_config = VaultConfig::new(&new_master, new_password)?;
-        let report = rotation::run(
-            &self.path,
-            &old_master,
-            &new_master,
-            &new_config,
-            discarded,
-        )?;
+        let report = rotation::run(&self.path, &old_master, &new_master, &new_config, discarded)?;
 
         self.keystore.lock();
         Ok(report)
@@ -1106,12 +1100,7 @@ impl Vault {
                     }
                     if source.is_dir() {
                         add_directory_tree(
-                            &self.path,
-                            &master,
-                            &source,
-                            &root_name,
-                            &mut all,
-                            padding,
+                            &self.path, &master, &source, &root_name, &mut all, padding,
                         )?;
                     } else {
                         let id = new_entry_id();
