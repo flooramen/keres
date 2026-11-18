@@ -30,7 +30,9 @@ and coercion of the password itself.
 - **Index log:** a fresh random 96-bit nonce per record under an HKDF subkey
   derived from the master and a random per-log `log_id`. The AAD binds the
   authenticated log header and the record index, so records cannot be
-  reordered, spliced between logs, or replayed under another generation.
+  reordered, spliced between logs, or replayed under another generation. The
+  header is also bound to the exact snapshot hash and the snapshot's
+  authenticated internal generation.
 
 ### Associated Data
 

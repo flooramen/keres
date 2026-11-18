@@ -39,6 +39,8 @@ matters most for the monorepo.
 - [x] Orphan garbage collection (`verify --prune`).
 - [x] Append-only encrypted index log with snapshot compaction, journaled
       crash recovery, and automatic journal recovery on lock acquisition.
+- [x] Internal index generations: authenticated in the snapshot, matched by
+      the log, advanced by compaction, with crash-phase recovery tests.
 - [ ] Size padding to buckets and operation-count bucketing (L2+).
 - [ ] Parallel chunk pipeline.
 

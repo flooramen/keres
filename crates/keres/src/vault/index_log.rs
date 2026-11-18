@@ -200,13 +200,16 @@ pub(crate) fn exists(vault_dir: &Path) -> bool {
 /// Replays the log over `files`, returning its metadata when present.
 ///
 /// `snapshot_sha256` is the hash of the exact snapshot bytes that were just
-/// decoded. The log header must name it; otherwise the log belongs to a
-/// different snapshot and the caller sees [`Error::InvalidVault`].
+/// decoded and `snapshot_generation` is the generation stored inside that
+/// authenticated snapshot. The log header must name both; otherwise the log
+/// belongs to a different index state and the caller sees
+/// [`Error::InvalidVault`].
 pub(crate) fn replay(
     vault_dir: &Path,
     master: &Key,
     files: &mut ManifestMap,
     snapshot_sha256: Option<&[u8; HASH_LEN]>,
+    snapshot_generation: u64,
 ) -> Result<Option<LogInfo>> {
     if compaction_pending(vault_dir) {
         return Err(Error::Operation(
@@ -231,7 +234,7 @@ pub(crate) fn replay(
     let header = Header::parse(&header_bytes)?;
 
     let snapshot_hash = snapshot_sha256.ok_or(Error::InvalidVault)?;
-    if header.snapshot_sha256 != *snapshot_hash {
+    if header.snapshot_sha256 != *snapshot_hash || header.generation != snapshot_generation {
         return Err(Error::InvalidVault);
     }
 
@@ -463,23 +466,29 @@ pub(crate) fn recover(vault_dir: &Path) -> Result<()> {
         return Err(Error::InvalidVault);
     }
 
-    // The snapshot is now authoritative; the old log cannot extend it.
-    fsutil::remove_file_if_exists(&log_path(vault_dir))?;
-
+    // The snapshot is now authoritative; the old log cannot extend it. If the
+    // canonical log already names the new snapshot/generation, a previous run
+    // installed it and only cleanup is left.
+    let canonical_log = log_path(vault_dir);
     let next_log = next_log_path(vault_dir);
-    if next_log.is_file() {
-        let mut header_bytes = vec![0u8; HEADER_LEN];
-        let mut file = File::open(&next_log)?;
-        file.read_exact(&mut header_bytes)
-            .map_err(|_| Error::InvalidVault)?;
-        let header = Header::parse(&header_bytes)?;
-        if header.snapshot_sha256 != journal.snapshot_sha256
-            || header.generation != journal.generation
-        {
-            return Err(Error::InvalidVault);
+    if log_matches(&canonical_log, &journal) {
+        fsutil::remove_file_if_exists(&next_log)?;
+    } else {
+        fsutil::remove_file_if_exists(&canonical_log)?;
+        if next_log.is_file() {
+            let mut header_bytes = vec![0u8; HEADER_LEN];
+            let mut file = File::open(&next_log)?;
+            file.read_exact(&mut header_bytes)
+                .map_err(|_| Error::InvalidVault)?;
+            let header = Header::parse(&header_bytes)?;
+            if header.snapshot_sha256 != journal.snapshot_sha256
+                || header.generation != journal.generation
+            {
+                return Err(Error::InvalidVault);
+            }
+            fs::rename(&next_log, &canonical_log)?;
+            fsutil::sync_dir(&vault_dir.join("d"));
         }
-        fs::rename(&next_log, log_path(vault_dir))?;
-        fsutil::sync_dir(&vault_dir.join("d"));
     }
 
     // The staged snapshot is now either canonical or stale.
@@ -539,6 +548,24 @@ fn file_sha256(path: &Path) -> Option<[u8; HASH_LEN]> {
     Some(hasher.finalize().into())
 }
 
+/// Whether `path` holds a log header naming the journal's snapshot/generation.
+fn log_matches(path: &Path, journal: &CompactJournal) -> bool {
+    let mut bytes = vec![0u8; HEADER_LEN];
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    if file.read_exact(&mut bytes).is_err() {
+        return false;
+    }
+    match Header::parse(&bytes) {
+        Ok(header) => {
+            header.snapshot_sha256 == journal.snapshot_sha256
+                && header.generation == journal.generation
+        }
+        Err(_) => false,
+    }
+}
+
 fn log_path(vault_dir: &Path) -> PathBuf {
     vault_dir.join("d").join(LOG_FILE)
 }
@@ -587,10 +614,11 @@ mod tests {
         dir: &Path,
         master: &Key,
         snapshot: &[u8],
+        generation: u64,
     ) -> Result<(ManifestMap, Option<LogInfo>)> {
         let mut files = ManifestMap::new();
         let hash = digest(snapshot);
-        let info = replay(dir, master, &mut files, Some(&hash))?;
+        let info = replay(dir, master, &mut files, Some(&hash), generation)?;
         Ok((files, info))
     }
 
@@ -615,7 +643,7 @@ mod tests {
         .unwrap();
         assert_eq!(info.next_index, 2);
 
-        let (files, info) = replay_all(dir, &master, snapshot).unwrap();
+        let (files, info) = replay_all(dir, &master, snapshot, 7).unwrap();
         let info = info.unwrap();
         assert_eq!(info.generation, 7);
         assert_eq!(info.next_index, 2);
@@ -637,7 +665,13 @@ mod tests {
         let mut files = ManifestMap::new();
         let other = digest(b"snapshot-two");
         assert!(matches!(
-            replay(dir, &master, &mut files, Some(&other)),
+            replay(dir, &master, &mut files, Some(&other), 3),
+            Err(Error::InvalidVault)
+        ));
+
+        // The snapshot must also carry the same generation.
+        assert!(matches!(
+            replay(dir, &master, &mut files, Some(&hash), 4),
             Err(Error::InvalidVault)
         ));
 
@@ -668,7 +702,7 @@ mod tests {
 
         let mut files = ManifestMap::new();
         assert!(matches!(
-            replay(dir, &Key::generate(), &mut files, Some(&hash)),
+            replay(dir, &Key::generate(), &mut files, Some(&hash), 1),
             Err(Error::Authentication)
         ));
     }
@@ -688,7 +722,7 @@ mod tests {
         file.sync_data().unwrap();
         drop(file);
 
-        let (files, info2) = replay_all(dir, &master, snapshot).unwrap();
+        let (files, info2) = replay_all(dir, &master, snapshot, 1).unwrap();
         let info2 = info2.unwrap();
         assert_eq!(info2.valid_len, info.valid_len);
         assert!(files.contains_key("a"));
@@ -701,7 +735,7 @@ mod tests {
             info3.valid_len
         );
 
-        let (files, _) = replay_all(dir, &master, snapshot).unwrap();
+        let (files, _) = replay_all(dir, &master, snapshot, 1).unwrap();
         assert!(files.contains_key("a"));
         assert!(files.contains_key("b"));
     }
@@ -734,7 +768,7 @@ mod tests {
 
         let mut files = ManifestMap::new();
         assert!(matches!(
-            replay(dir, &master, &mut files, Some(&hash)),
+            replay(dir, &master, &mut files, Some(&hash), 1),
             Err(Error::Authentication)
         ));
     }
@@ -759,7 +793,7 @@ mod tests {
         );
         assert!(!compaction_pending(dir));
 
-        let (files, info) = replay_all(dir, &master, new_snapshot).unwrap();
+        let (files, info) = replay_all(dir, &master, new_snapshot, 5).unwrap();
         let info = info.unwrap();
         assert_eq!(info.generation, 5);
         assert_eq!(info.next_index, 0);
@@ -794,7 +828,7 @@ mod tests {
 
         assert!(!compaction_pending(dir));
         assert_eq!(std::fs::read(manifest::path(dir)).unwrap(), new_snapshot);
-        let (files, info) = replay_all(dir, &master, new_snapshot).unwrap();
+        let (files, info) = replay_all(dir, &master, new_snapshot, 2).unwrap();
         assert!(files.is_empty());
         assert_eq!(info.unwrap().generation, 2);
     }
@@ -813,6 +847,100 @@ mod tests {
         assert_eq!(std::fs::read(manifest::path(dir)).unwrap(), snapshot);
         assert!(!next_snapshot_path(dir).exists());
         assert!(!next_log_path(dir).exists());
+    }
+
+    /// Stages a compaction journal plus its files, leaving the crash point to
+    /// the caller.
+    fn stage_compaction(dir: &Path, old_snapshot: &[u8], new_snapshot: &[u8]) {
+        fsutil::atomic_write(&manifest::path(dir), old_snapshot).unwrap();
+        let header = Header::new(2, digest(new_snapshot));
+        fsutil::atomic_write(&next_snapshot_path(dir), new_snapshot).unwrap();
+        fsutil::atomic_write(&next_log_path(dir), &header.bytes).unwrap();
+        let journal = serde_json::to_vec(&CompactJournal {
+            version: 1,
+            generation: 2,
+            snapshot_sha256: digest(new_snapshot),
+        })
+        .unwrap();
+        fsutil::atomic_write(&compact_path(dir), &journal).unwrap();
+    }
+
+    #[test]
+    fn recovers_after_the_snapshot_rename_but_before_log_cleanup() {
+        let tmp = temp_vault();
+        let dir = tmp.path();
+        let master = Key::generate();
+        let old_snapshot = b"old-snapshot";
+        let new_snapshot = b"new-snapshot";
+        stage_compaction(dir, old_snapshot, new_snapshot);
+        // An old log with records is still the canonical log.
+        let old_hash = digest(old_snapshot);
+        append(dir, &master, &old_hash, 1, None, &[put("a")]).unwrap();
+        // Crash point: the snapshot was already promoted.
+        fsutil::atomic_write(&manifest::path(dir), new_snapshot).unwrap();
+
+        recover(dir).unwrap();
+
+        assert_eq!(std::fs::read(manifest::path(dir)).unwrap(), new_snapshot);
+        let (files, info) = replay_all(dir, &master, new_snapshot, 2).unwrap();
+        assert!(files.is_empty());
+        assert_eq!(info.unwrap().next_index, 0);
+        assert!(!compact_path(dir).exists());
+    }
+
+    #[test]
+    fn recovers_after_old_log_removal_but_before_staged_log_install() {
+        let tmp = temp_vault();
+        let dir = tmp.path();
+        let master = Key::generate();
+        let old_snapshot = b"old-snapshot";
+        let new_snapshot = b"new-snapshot";
+        stage_compaction(dir, old_snapshot, new_snapshot);
+        // Crash point: snapshot promoted and the old log removed; the staged
+        // log has not been renamed yet.
+        fsutil::atomic_write(&manifest::path(dir), new_snapshot).unwrap();
+
+        recover(dir).unwrap();
+
+        assert!(log_path(dir).is_file());
+        assert!(!next_log_path(dir).exists());
+        assert!(!compact_path(dir).exists());
+        let (_, info) = replay_all(dir, &master, new_snapshot, 2).unwrap();
+        let info = info.unwrap();
+        assert_eq!(info.generation, 2);
+
+        // The installed log accepts new records under the same generation.
+        let hash = digest(new_snapshot);
+        append(dir, &master, &hash, 2, Some(&info), &[put("b")]).unwrap();
+        let (files, _) = replay_all(dir, &master, new_snapshot, 2).unwrap();
+        assert!(files.contains_key("b"));
+    }
+
+    #[test]
+    fn recovers_after_staged_log_install_but_before_journal_removal() {
+        let tmp = temp_vault();
+        let dir = tmp.path();
+        let master = Key::generate();
+        let old_snapshot = b"old-snapshot";
+        let new_snapshot = b"new-snapshot";
+        stage_compaction(dir, old_snapshot, new_snapshot);
+        // Crash point: everything is installed, only the journal remains.
+        fsutil::atomic_write(&manifest::path(dir), new_snapshot).unwrap();
+        fs::rename(next_log_path(dir), log_path(dir)).unwrap();
+        fsutil::remove_file_if_exists(&next_snapshot_path(dir)).unwrap();
+
+        recover(dir).unwrap();
+
+        assert!(!compact_path(dir).exists());
+        // The already-installed log is kept, so appends continue in place.
+        let (files, info) = replay_all(dir, &master, new_snapshot, 2).unwrap();
+        assert!(files.is_empty());
+        let info = info.unwrap();
+        assert_eq!(info.generation, 2);
+        let hash = digest(new_snapshot);
+        append(dir, &master, &hash, 2, Some(&info), &[put("a")]).unwrap();
+        let (files, _) = replay_all(dir, &master, new_snapshot, 2).unwrap();
+        assert!(files.contains_key("a"));
     }
 
     #[test]

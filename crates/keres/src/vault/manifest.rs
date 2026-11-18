@@ -67,6 +67,12 @@ pub(crate) type ManifestMap = BTreeMap<String, EntryMetadata>;
 #[derive(Serialize, Deserialize)]
 struct ManifestFile {
     version: u32,
+    /// Monotonic index generation, authenticated inside the snapshot.
+    ///
+    /// Pre-generation v3 snapshots deserialize as `0`; the first compaction
+    /// advances them normally.
+    #[serde(default)]
+    generation: u64,
     files: ManifestMap,
 }
 
@@ -79,13 +85,24 @@ pub(crate) fn next_path(vault_dir: &Path) -> std::path::PathBuf {
     vault_dir.join("d").join(".manifest.enc.next")
 }
 
+/// A decoded snapshot plus its authenticated generation.
+pub(crate) struct Snapshot {
+    files: ManifestMap,
+    generation: u64,
+}
+
 /// A decoded manifest, tagged by its on-disk schema version.
 pub(crate) enum ManifestContents {
     /// Legacy 0.4/0.5 index: blobs are addressed by entry path and entries
     /// carry no stable ID.
     V2(ManifestMap),
     /// Current index: every entry carries a stable random ID.
-    V3(ManifestMap),
+    V3 {
+        /// Full index.
+        files: ManifestMap,
+        /// Authenticated generation.
+        generation: u64,
+    },
 }
 
 /// Loads the manifest, fully authenticating its snapshot and log.
@@ -93,23 +110,36 @@ pub(crate) enum ManifestContents {
 /// A *missing* snapshot yields an empty index; anything present but damaged,
 /// truncated or unauthentic is an error — silently treating corruption as
 /// "no entries" would let the next save drop every existing record. A log that
-/// references a different snapshot is likewise an error.
+/// references a different snapshot or generation is likewise an error.
 pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
-    let (mut files, snapshot_sha256) = load_snapshot(vault_dir, master)?;
-    index_log::replay(vault_dir, master, &mut files, snapshot_sha256.as_ref())?;
-    Ok(files)
+    let (mut snapshot, snapshot_sha256) = load_snapshot(vault_dir, master)?;
+    index_log::replay(
+        vault_dir,
+        master,
+        &mut snapshot.files,
+        snapshot_sha256.as_ref(),
+        snapshot.generation,
+    )?;
+    Ok(snapshot.files)
 }
 
-/// Reads and decodes the snapshot, returning its hash for log binding.
+/// Reads and decodes the snapshot, returning its hash and generation for log
+/// binding.
 ///
-/// The hash is `None` only when no snapshot exists (a new or unmigrated
-/// vault); callers must reject a log in that case.
-fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(ManifestMap, Option<[u8; HASH_LEN]>)> {
+/// A missing snapshot reports generation `1`, the value a new snapshot will
+/// use. The hash is `None` only in that case; callers must reject a log.
+fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(Snapshot, Option<[u8; HASH_LEN]>)> {
     let path = path(vault_dir);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((ManifestMap::new(), None))
+            return Ok((
+                Snapshot {
+                    files: ManifestMap::new(),
+                    generation: 1,
+                },
+                None,
+            ))
         }
         Err(e) => return Err(e.into()),
     };
@@ -120,7 +150,8 @@ fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(ManifestMap, Option<
         .map_err(|_| Error::InvalidVault)?;
 
     let snapshot_sha256 = index_log::digest(&bytes);
-    Ok((decode(&bytes, master)?, Some(snapshot_sha256)))
+    let snapshot = decode_snapshot(&bytes, master)?;
+    Ok((snapshot, Some(snapshot_sha256)))
 }
 
 /// Decodes and authenticates manifest bytes. Shared by [`load`] and the
@@ -128,7 +159,15 @@ fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(ManifestMap, Option<
 pub(crate) fn decode(bytes: &[u8], master: &Key) -> Result<ManifestMap> {
     match decode_contents(bytes, master)? {
         ManifestContents::V2(_) => Err(Error::MigrationRequired),
-        ManifestContents::V3(files) => Ok(files),
+        ManifestContents::V3 { files, .. } => Ok(files),
+    }
+}
+
+/// Decodes a snapshot, rejecting legacy formats that cannot carry a log.
+fn decode_snapshot(bytes: &[u8], master: &Key) -> Result<Snapshot> {
+    match decode_contents(bytes, master)? {
+        ManifestContents::V2(_) => Err(Error::MigrationRequired),
+        ManifestContents::V3 { files, generation } => Ok(Snapshot { files, generation }),
     }
 }
 
@@ -151,7 +190,7 @@ pub(crate) fn load_legacy_v2(vault_dir: &Path, master: &Key) -> Result<ManifestM
 
     match decode_contents(&bytes, master)? {
         ManifestContents::V2(files) => Ok(files),
-        ManifestContents::V3(_) => Err(Error::Operation(
+        ManifestContents::V3 { .. } => Err(Error::Operation(
             "vault already uses the current format".into(),
         )),
     }
@@ -186,7 +225,10 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
             if manifest.files.values().any(|entry| entry.id.is_empty()) {
                 return Err(Error::InvalidVault);
             }
-            Ok(ManifestContents::V3(manifest.files))
+            Ok(ManifestContents::V3 {
+                files: manifest.files,
+                generation: manifest.generation,
+            })
         }
         other => Err(Error::UnsupportedVersion(other)),
     }
@@ -199,13 +241,13 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
 /// accumulated enough records. A missing snapshot is written directly (new
 /// vault or legacy migration). Callers hold the exclusive vault lock.
 pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Result<()> {
-    let (mut current, snapshot_sha256) = match load_snapshot(vault_dir, master) {
+    let (mut snapshot, snapshot_sha256) = match load_snapshot(vault_dir, master) {
         Ok(state) => state,
         Err(Error::MigrationRequired) => {
             // The legacy index is replaced wholesale; never try to merge with
             // records that belong to another schema.
             index_log::remove_all(vault_dir)?;
-            let blob = encode(files, master)?;
+            let blob = encode(files, master, 1)?;
             return fsutil::atomic_write(&path(vault_dir), &blob);
         }
         Err(e) => return Err(e),
@@ -218,27 +260,38 @@ pub(crate) fn save(vault_dir: &Path, files: &ManifestMap, master: &Key) -> Resul
             return Err(Error::InvalidVault);
         }
         index_log::remove_all(vault_dir)?;
-        let blob = encode(files, master)?;
+        let blob = encode(files, master, snapshot.generation)?;
         return fsutil::atomic_write(&path(vault_dir), &blob);
     };
 
-    let log = index_log::replay(vault_dir, master, &mut current, Some(&snapshot_sha256))?;
+    let log = index_log::replay(
+        vault_dir,
+        master,
+        &mut snapshot.files,
+        Some(&snapshot_sha256),
+        snapshot.generation,
+    )?;
 
-    if current == *files {
+    if snapshot.files == *files {
         return Ok(());
     }
 
+    // `replay` guarantees this matches the snapshot; prefer the log's copy so
+    // the field stays the single source for the mutation phase.
+    let generation = log
+        .as_ref()
+        .map_or(snapshot.generation, |info| info.generation);
+
     if log.as_ref().is_some_and(|info| info.should_compact()) {
-        let generation = log.as_ref().map_or(1, |info| info.generation + 1);
-        let blob = encode(files, master)?;
+        let generation = generation.saturating_add(1);
+        let blob = encode(files, master, generation)?;
         return index_log::compact(vault_dir, &blob, generation);
     }
 
-    let ops = diff(&current, files);
+    let ops = diff(&snapshot.files, files);
     if ops.is_empty() {
         return Ok(());
     }
-    let generation = log.as_ref().map_or(1, |info| info.generation);
     index_log::append(
         vault_dir,
         master,
@@ -272,10 +325,12 @@ fn diff(old: &ManifestMap, new: &ManifestMap) -> Vec<LogOp> {
 /// Encodes the manifest as a fresh container under `master`.
 ///
 /// Deep rotation writes the encoded bytes to a staging path before swapping
-/// them in, so the same encoder is shared with [`save`].
-pub(crate) fn encode(files: &ManifestMap, master: &Key) -> Result<Vec<u8>> {
+/// them in, so the same encoder is shared with [`save`]. `generation` is
+/// stored inside the authenticated JSON.
+pub(crate) fn encode(files: &ManifestMap, master: &Key, generation: u64) -> Result<Vec<u8>> {
     let manifest = ManifestFile {
         version: MANIFEST_VERSION,
+        generation,
         files: files.clone(),
     };
     let json = Zeroizing::new(serde_json::to_vec(&manifest).map_err(|_| Error::Encryption)?);
@@ -337,6 +392,7 @@ mod tests {
         save(dir, &files, &master).unwrap();
         let snapshot = std::fs::read(path(dir)).unwrap();
         assert!(!index_log::exists(dir));
+        assert_eq!(decode_snapshot(&snapshot, &master).unwrap().generation, 1);
 
         files.insert("a".into(), meta("a"));
         files.insert("b".into(), meta("b"));
@@ -378,5 +434,9 @@ mod tests {
         assert!(std::fs::read(path(dir)).unwrap() != original);
         assert!(log_len(dir) < 200, "log should restart after compaction");
         assert_eq!(load(dir, &master).unwrap(), files);
+
+        // The snapshot's authenticated generation advances on compaction.
+        let compacted = std::fs::read(path(dir)).unwrap();
+        assert_eq!(decode_snapshot(&compacted, &master).unwrap().generation, 2);
     }
 }

@@ -23,6 +23,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and shared lock acquisition finish a committed rotation or index compaction
   before the config or index is read, so a crash between a journal write and
   its cleanup cannot make the vault unreadable.
+- Index state now carries an authenticated internal generation. The snapshot
+  records it, a log must declare the same value as the snapshot it extends,
+  and compaction advances it by one. Pre-generation snapshots read as
+  generation 0. This makes snapshot/log swaps unambiguous for crash recovery;
+  it is not a rollback guarantee without hardware-backed state.
 
 ## [Unreleased] — 0.6.0
 

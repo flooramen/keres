@@ -84,9 +84,11 @@ property will never be accepted for a compatibility or convenience win.
   compaction, and journaled compaction recovery.)*
 - **Group commit** — coalesce concurrent writers into one durable batch so a
   busy vault pays for one `sync_data` per group rather than per mutation.
-- **Index generations and rollback detection** — carry a monotonic generation
-  in the snapshot/log header and config, making restored older index state
-  detectable on unlock (limitation 6).
+- **Index generations** — carry a monotonic generation in the snapshot/log
+  header and require them to agree, so replace and compaction swaps are
+  unambiguous. *(Internal generations done; snapshots authenticate the
+  generation and compaction advances it.)* Turning the counter into actual
+  rollback detection still needs hardware-backed state (limitation 6).
 - **L2+ metadata protection** — pad entry sizes to fixed buckets, coarsen
   observable timing, and optionally bucket mutation counts. Explicit
   non-goals: access-pattern hiding, exact-count hiding, and deniability.

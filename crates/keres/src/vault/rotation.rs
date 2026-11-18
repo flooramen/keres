@@ -106,7 +106,7 @@ pub(crate) fn run(
         new_files.insert(vault_path.clone(), meta);
     }
 
-    let manifest_blob = manifest::encode(&new_files, new_master)?;
+    let manifest_blob = manifest::encode(&new_files, new_master, 1)?;
     let digest = sha256_hex(&manifest_blob);
     fsutil::atomic_write(&next_manifest_path(vault_dir), &manifest_blob)?;
 
@@ -419,7 +419,7 @@ mod tests {
             meta.original_size = size;
             new_files.insert(path.clone(), meta);
         }
-        let blob = manifest::encode(&new_files, &new_master).unwrap();
+        let blob = manifest::encode(&new_files, &new_master, 1).unwrap();
         fsutil::atomic_write(&next_manifest_path(&dir), &blob).unwrap();
         let journal = Journal {
             version: JOURNAL_VERSION,

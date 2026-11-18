@@ -420,6 +420,14 @@ ties the log to exactly one snapshot: mixing a log with a different snapshot
 is `InvalidVault`, and a log whose key does not authenticate is
 `Authentication`.
 
+The snapshot's authenticated JSON also carries a monotonic `generation`
+(pre-generation v3 snapshots read as `0`). A log must declare the same
+generation as the snapshot it extends; a mismatch is `InvalidVault`.
+Compaction writes `generation + 1` into the new snapshot and its empty log.
+Generations are internal: they make replace/compaction swaps unambiguous and
+support consistent read snapshots, but without hardware-backed state they are
+not a rollback detector.
+
 A log is written with one `write_all` plus `sync_data` per batch. A crash may
 leave a torn final record; replay stops at the last valid record and the next
 append truncates the tail. Damage in the middle of the log is an error, never
@@ -445,7 +453,7 @@ Load semantics (hardened after audit finding #1):
 |---|---|
 | Snapshot and log absent | empty index (fresh/uninitialized data dir) |
 | Snapshot present but damaged/truncated/unauthentic | **error** — never silently empty |
-| Log present but snapshot absent, or bound to another snapshot | **error** |
+| Log present but snapshot absent, or bound to another snapshot/generation | **error** |
 | Snapshot larger than the 64 MiB read cap | rejected before allocation |
 
 ### Operations
