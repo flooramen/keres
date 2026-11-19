@@ -194,7 +194,7 @@ enum Commands {
         #[arg(long)]
         set: Option<String>,
     },
-    /// Remove an entry and rotate the master key (crypto-erasure).
+    /// Remove an entry and rotate the master key (forward key invalidation).
     Erase {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
         vault: String,
@@ -712,10 +712,11 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
                 return Ok(());
             }
             let password = passwords.read("Enter vault password")?;
-            let new_password = passwords.read("New password after erase")?;
-            let confirm_pw = passwords.read("Confirm new password")?;
-            if new_password.as_str() != confirm_pw.as_str() {
-                return Err(Error::Operation("passwords don't match".into()));
+            let new_password = read_new_password("New password after erase")?;
+            if new_password.as_str() == password.as_str() {
+                return Err(Error::Operation(
+                    "new password must differ from the current password".into(),
+                ));
             }
             let mut v = Vault::new(dir);
             v.unlock(password.as_str())?;
@@ -777,11 +778,7 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
             RecoveryCommands::Use { vault } => {
                 let dir = existing_vault_path(&vault)?;
                 let code = read_recovery_code()?;
-                let new = passwords.read("New password")?;
-                let confirm = passwords.read("Confirm new password")?;
-                if new.as_str() != confirm.as_str() {
-                    return Err(Error::Operation("new passwords don't match".into()));
-                }
+                let new = read_new_password("New password")?;
                 Vault::new(dir).recover(code.as_str(), new.as_str())?;
                 println!(
                     "Vault recovered. The recovery kit was consumed; create a new one if needed."

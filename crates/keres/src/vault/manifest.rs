@@ -60,6 +60,13 @@ pub struct EntryMetadata {
     /// Full paths of direct children (directories only).
     #[serde(default)]
     pub children: Option<Vec<String>>,
+    /// SHA-256 of the entry's plaintext, hex-encoded.
+    ///
+    /// Stored in the authenticated index so a storage attacker cannot swap in
+    /// an older valid blob for the same entry ID. `None` on entries written by
+    /// releases before this field existed; those can only be size-checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 /// The full vault index.
@@ -118,10 +125,10 @@ pub(crate) enum ManifestContents {
 
 /// Loads the manifest, fully authenticating its snapshot and log.
 ///
-/// A *missing* snapshot yields an empty index; anything present but damaged,
-/// truncated or unauthentic is an error — silently treating corruption as
-/// "no entries" would let the next save drop every existing record. A log that
-/// references a different snapshot or generation is likewise an error.
+/// A missing snapshot is an error, not an empty index: treating it as "no
+/// entries" would let the next save drop every existing record, make `verify`
+/// report a healthy empty vault, and let a foreign recovery kit validate
+/// against an empty index. Use [`init`] to create the first snapshot.
 pub(crate) fn load(vault_dir: &Path, master: &Key) -> Result<ManifestMap> {
     Ok(load_with_padding(vault_dir, master)?.0)
 }
@@ -133,7 +140,7 @@ pub(crate) fn load_with_padding(vault_dir: &Path, master: &Key) -> Result<(Manif
         vault_dir,
         master,
         &mut snapshot.files,
-        snapshot_sha256.as_ref(),
+        Some(&snapshot_sha256),
         snapshot.generation,
     )?;
     Ok((snapshot.files, snapshot.padding))
@@ -146,32 +153,33 @@ pub(crate) fn current_version(vault_dir: &Path, master: &Key) -> Result<(u64, u6
         vault_dir,
         master,
         &mut snapshot.files,
-        snapshot_sha256.as_ref(),
+        Some(&snapshot_sha256),
         snapshot.generation,
     )?;
     let records = log.map(|info| info.next_index).unwrap_or(0);
     Ok((snapshot.generation, records))
 }
 
-/// Reads and decodes the snapshot, returning its hash and generation for log
-/// binding.
+/// Writes the initial empty snapshot for a brand-new vault.
 ///
-/// A missing snapshot reports generation `1`, the value a new snapshot will
-/// use. The hash is `None` only in that case; callers must reject a log.
-fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(Snapshot, Option<[u8; HASH_LEN]>)> {
+/// The caller must have verified that no usable vault exists (no config and no
+/// recovery kit). Any stale index log is discarded: it would have been
+/// encrypted under a master key that no longer exists.
+pub(crate) fn init(vault_dir: &Path, master: &Key, padding: Padding) -> Result<()> {
+    padding.validate()?;
+    index_log::remove_all(vault_dir)?;
+    let blob = encode(&ManifestMap::new(), master, 1, padding)?;
+    fsutil::atomic_write(&path(vault_dir), &blob)
+}
+
+/// Reads and decodes the snapshot, returning its hash for log binding.
+///
+/// A missing snapshot is an error; [`init`] is the only way to create one.
+fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(Snapshot, [u8; HASH_LEN])> {
     let path = path(vault_dir);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((
-                Snapshot {
-                    files: ManifestMap::new(),
-                    generation: 1,
-                    padding: Padding::None,
-                },
-                None,
-            ))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::InvalidVault),
         Err(e) => return Err(e.into()),
     };
 
@@ -182,7 +190,7 @@ fn load_snapshot(vault_dir: &Path, master: &Key) -> Result<(Snapshot, Option<[u8
 
     let snapshot_sha256 = index_log::digest(&bytes);
     let snapshot = decode_snapshot(&bytes, master)?;
-    Ok((snapshot, Some(snapshot_sha256)))
+    Ok((snapshot, snapshot_sha256))
 }
 
 /// Decodes and authenticates manifest bytes. Shared by [`load`] and the
@@ -264,6 +272,13 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
             if manifest.files.values().any(|entry| entry.id.is_empty()) {
                 return Err(Error::InvalidVault);
             }
+            if manifest.files.values().any(|entry| {
+                entry.content_hash.as_ref().is_some_and(|hash| {
+                    hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+            }) {
+                return Err(Error::InvalidVault);
+            }
             Ok(ManifestContents::V3 {
                 files: manifest.files,
                 generation: manifest.generation,
@@ -278,8 +293,9 @@ fn decode_contents(bytes: &[u8], master: &Key) -> Result<ManifestContents> {
 ///
 /// Existing state is loaded once, the difference is appended as a single
 /// authenticated log batch, and a fresh snapshot is written when the log has
-/// accumulated enough records. A missing snapshot is written directly (new
-/// vault or legacy migration). Callers hold the exclusive vault lock.
+/// accumulated enough records. The snapshot must already exist ([`init`]
+/// creates it); a legacy snapshot is replaced wholesale during migration.
+/// Callers hold the exclusive vault lock.
 pub(crate) fn save(
     vault_dir: &Path,
     files: &ManifestMap,
@@ -297,17 +313,6 @@ pub(crate) fn save(
             return fsutil::atomic_write(&path(vault_dir), &blob);
         }
         Err(e) => return Err(e),
-    };
-
-    let Some(snapshot_sha256) = snapshot_sha256 else {
-        // No snapshot yet. A log cannot extend nothing, so its presence means
-        // the index was lost or damaged.
-        if index_log::exists(vault_dir) {
-            return Err(Error::InvalidVault);
-        }
-        index_log::remove_all(vault_dir)?;
-        let blob = encode(files, master, snapshot.generation, padding)?;
-        return fsutil::atomic_write(&path(vault_dir), &blob);
     };
 
     let log = index_log::replay(
@@ -364,7 +369,7 @@ pub(crate) fn set_padding(vault_dir: &Path, master: &Key, padding: Padding) -> R
         vault_dir,
         master,
         &mut snapshot.files,
-        snapshot_sha256.as_ref(),
+        Some(&snapshot_sha256),
         snapshot.generation,
     )?;
 
@@ -455,6 +460,7 @@ mod tests {
             original_size: 1,
             is_directory: false,
             children: None,
+            content_hash: None,
         }
     }
 
@@ -471,7 +477,7 @@ mod tests {
         let master = Key::generate();
 
         let mut files = ManifestMap::new();
-        save(dir, &files, &master, Padding::None).unwrap();
+        init(dir, &master, Padding::None).unwrap();
         let snapshot = std::fs::read(path(dir)).unwrap();
         assert!(!index_log::exists(dir));
         assert_eq!(decode_snapshot(&snapshot, &master).unwrap().generation, 1);
@@ -499,7 +505,7 @@ mod tests {
         let master = Key::generate();
 
         let mut files = ManifestMap::new();
-        save(dir, &files, &master, Padding::None).unwrap();
+        init(dir, &master, Padding::None).unwrap();
         let original = std::fs::read(path(dir)).unwrap();
 
         for i in 0..512 {

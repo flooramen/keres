@@ -193,6 +193,7 @@ pub(crate) fn compaction_pending(vault_dir: &Path) -> bool {
 }
 
 /// Whether an append-only log currently exists.
+#[cfg(test)]
 pub(crate) fn exists(vault_dir: &Path) -> bool {
     log_path(vault_dir).is_file()
 }
@@ -600,6 +601,7 @@ mod tests {
             original_size: 1,
             is_directory: false,
             children: None,
+            content_hash: None,
         }
     }
 

@@ -21,6 +21,7 @@
 //! password. Extra keyslots and any existing recovery kit wrap the old master
 //! key and cannot survive, so they are invalidated (the kit file is removed).
 
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,11 @@ struct Journal {
     version: u32,
     manifest_sha256: String,
     config: String,
+    /// Vault-relative paths of blobs encrypted under the old master. Recovery
+    /// deletes them after the swap so an interrupted rotation cannot leave
+    /// old-key ciphertext behind.
+    #[serde(default)]
+    old_blobs: Vec<String>,
 }
 
 /// Whether an interrupted rotation left a journal behind.
@@ -76,12 +82,15 @@ pub(crate) fn pending(vault_dir: &Path) -> bool {
 /// The caller holds the exclusive vault lock and has already unwrapped
 /// `old_master` and built a single-slot `new_config` around `new_master`.
 /// `discarded_keyslots` is the number of old slots that cannot survive.
+/// Names in `removed` are omitted from the new index (used by
+/// [`crate::Vault::erase`] to make removal and rotation a single commit).
 pub(crate) fn run(
     vault_dir: &Path,
     old_master: &Key,
     new_master: &Key,
     new_config: &VaultConfig,
     discarded_keyslots: usize,
+    removed: &HashSet<String>,
 ) -> Result<RotationReport> {
     let (old_files, padding) = manifest::load_with_padding(vault_dir, old_master)?;
 
@@ -92,11 +101,14 @@ pub(crate) fn run(
     };
 
     for (vault_path, old) in &old_files {
+        if removed.contains(vault_path) {
+            continue;
+        }
         let mut meta = old.clone();
         if old.is_directory {
             // Authenticate the placeholder before replacing it.
-            blobs::read_entry(vault_dir, old_master, &old.id, true, |_| Ok(()))?;
-            blobs::write_entry_from_reader(
+            blobs::read_entry_checked(vault_dir, old_master, old, |_| Ok(()))?;
+            let (_, hash, _) = blobs::write_entry_from_reader(
                 vault_dir,
                 new_master,
                 &old.id,
@@ -106,9 +118,12 @@ pub(crate) fn run(
                 None,
             )?;
             meta.original_size = 0;
+            meta.content_hash = Some(hash);
         } else {
-            let size = copy_file(vault_dir, old_master, new_master, &old.id, &meta, padding)?;
+            let (size, hash) =
+                copy_file(vault_dir, old_master, new_master, &old.id, &meta, padding)?;
             meta.original_size = size;
+            meta.content_hash = Some(hash);
             report.bytes += size;
         }
         report.entries += 1;
@@ -120,10 +135,21 @@ pub(crate) fn run(
     fsutil::atomic_write(&next_manifest_path(vault_dir), &manifest_blob)?;
 
     let config_json = serde_json::to_string_pretty(new_config).map_err(|_| Error::InvalidVault)?;
+    let old_blobs = old_files
+        .values()
+        .map(|old| {
+            let path = blobs::blob_path(vault_dir, old_master, &old.id);
+            path.strip_prefix(vault_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
     let journal = Journal {
         version: JOURNAL_VERSION,
         manifest_sha256: digest,
         config: config_json.clone(),
+        old_blobs,
     };
     let journal_json = serde_json::to_vec(&journal).map_err(|_| Error::InvalidVault)?;
 
@@ -141,13 +167,14 @@ pub(crate) fn run(
     // The index log was encrypted under the old master and extends the old
     // snapshot; the new snapshot replaces both.
     index_log::remove_all(vault_dir)?;
-    fsutil::remove_file_if_exists(&journal_path(vault_dir))?;
 
-    // Old blobs are unreachable under the new master. Best-effort cleanup;
-    // anything left behind is reclaimed by `prune_orphans`.
+    // Old blobs are unreachable under the new master. Best-effort cleanup; the
+    // journal still lists them, so recovery retries after a crash. Anything
+    // left behind is also reclaimed by `prune_orphans`.
     for old in old_files.values() {
         let _ = blobs::remove_blob(vault_dir, old_master, &old.id);
     }
+    fsutil::remove_file_if_exists(&journal_path(vault_dir))?;
 
     Ok(report)
 }
@@ -204,8 +231,34 @@ pub(crate) fn recover(vault_dir: &Path) -> Result<()> {
     recovery::remove(vault_dir)?;
     // The old log belonged to the pre-rotation snapshot/master.
     index_log::remove_all(vault_dir)?;
+    // The old master is no longer available here, but the journal records the
+    // old blob paths so recovery can still remove old-key ciphertext.
+    remove_journal_blobs(vault_dir, &journal.old_blobs);
     fsutil::remove_file_if_exists(&journal_path)?;
     Ok(())
+}
+
+/// Deletes old-key blobs listed in a rotation journal.
+///
+/// The journal is unauthenticated, so only paths that look like vault blobs
+/// under `d/` are accepted; anything else is ignored.
+fn remove_journal_blobs(vault_dir: &Path, rels: &[String]) {
+    for rel in rels {
+        let path = Path::new(rel);
+        let mut components = path.components();
+        let under_data_dir =
+            components.next().map(|c| c.as_os_str()) == Some(std::ffi::OsStr::new("d"));
+        let all_normal = components.all(|c| matches!(c, std::path::Component::Normal(_)));
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !path.is_absolute()
+            && under_data_dir
+            && all_normal
+            && name.ends_with(".enc")
+            && name != ".manifest.enc"
+        {
+            let _ = fs::remove_file(vault_dir.join(path));
+        }
+    }
 }
 
 fn journal_path(vault_dir: &Path) -> PathBuf {
@@ -227,22 +280,20 @@ fn copy_file(
     entry_id: &str,
     meta: &EntryMetadata,
     padding: Padding,
-) -> Result<u64> {
+) -> Result<(u64, String)> {
     let (tx, rx) = mpsc::sync_channel::<Zeroizing<Vec<u8>>>(4);
     let expected_size = meta.original_size;
 
-    std::thread::scope(|scope| -> Result<u64> {
+    std::thread::scope(|scope| -> Result<(u64, String)> {
         // `move` is essential: the sender must be dropped when the producer
         // finishes so the reader sees end-of-stream.
         let producer = scope.spawn(move || -> Result<u64> {
-            let meta = blobs::read_entry(vault_dir, old_master, entry_id, false, |chunk| {
+            // Verify the old blob's size and content hash before re-encrypting
+            // it; a substituted older blob aborts the rotation.
+            blobs::read_entry_checked(vault_dir, old_master, meta, |chunk| {
                 tx.send(Zeroizing::new(chunk.to_vec()))
                     .map_err(|_| Error::Operation("rotation stream cancelled".into()))
-            })?;
-            if meta.original_size != expected_size {
-                return Err(Error::Authentication);
-            }
-            Ok(meta.original_size)
+            })
         });
 
         let mut reader = ChannelReader::new(rx);
@@ -261,8 +312,12 @@ fn copy_file(
             .join()
             .map_err(|_| Error::Operation("rotation worker panicked".into()))?;
 
-        write?;
-        read
+        let (_, hash, written) = write?;
+        let read = read?;
+        if written != read {
+            return Err(Error::Authentication);
+        }
+        Ok((read, hash))
     })
 }
 
@@ -431,7 +486,7 @@ mod tests {
         let mut new_files = ManifestMap::new();
         for (path, old) in &old_files {
             let mut meta = old.clone();
-            let size = copy_file(
+            let (size, hash) = copy_file(
                 &dir,
                 &old_master,
                 &new_master,
@@ -441,6 +496,7 @@ mod tests {
             )
             .unwrap();
             meta.original_size = size;
+            meta.content_hash = Some(hash);
             new_files.insert(path.clone(), meta);
         }
         let blob = manifest::encode(&new_files, &new_master, 1, Padding::None).unwrap();
@@ -449,6 +505,7 @@ mod tests {
             version: JOURNAL_VERSION,
             manifest_sha256: sha256_hex(&blob),
             config: serde_json::to_string_pretty(&new_config).unwrap(),
+            old_blobs: Vec::new(),
         };
         fsutil::atomic_write(&journal_path(&dir), &serde_json::to_vec(&journal).unwrap()).unwrap();
         std::fs::rename(next_manifest_path(&dir), manifest::path(&dir)).unwrap();
@@ -476,6 +533,7 @@ mod tests {
             version: JOURNAL_VERSION,
             manifest_sha256: "00".repeat(32),
             config: serde_json::to_string_pretty(&new_config).unwrap(),
+            old_blobs: Vec::new(),
         };
         fsutil::atomic_write(&journal_path(&dir), &serde_json::to_vec(&journal).unwrap()).unwrap();
 

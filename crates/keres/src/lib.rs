@@ -1,6 +1,6 @@
 //! # keres
 //!
-//! Encrypted vaults and single-file encryption with full metadata
+//! Encrypted vaults and single-file encryption with strong, opt-in metadata
 //! protection, built on AES-256-GCM and Argon2id.
 //!
 //! ## Highlights
@@ -15,11 +15,13 @@
 //!   risk on large files.
 //! * **Streaming** — 64 KiB chunks with constant memory use for files of any
 //!   size.
-//! * **Metadata privacy** — original filenames never appear unencrypted,
-//!   neither in `.krs` containers nor inside vaults.
-//! * **Crash safety** — vault configs, manifests and outputs are written via
-//!   temp file + rename; interrupted operations never leave half-written
-//!   plaintext or bricked containers.
+//! * **Metadata privacy** — original filenames and directory structure never
+//!   appear unencrypted, neither in `.krs` containers nor inside vaults.
+//!   Opt-in size padding ([`padding::Padding`]) hides exact file sizes behind
+//!   buckets; by default sizes remain observable.
+//! * **Crash safety** — configs, manifests and outputs are staged and
+//!   committed atomically. The vault index is an authenticated snapshot plus
+//!   an append-only log, with journaled compaction and rotation.
 //! * **Hardened memory** — keys live in [`zeroize::Zeroizing`] buffers and
 //!   are scrubbed on drop.
 //!
@@ -79,10 +81,14 @@
 //! See `SECURITY.md` in the repository for the full write-up including
 //! threat model and known limitations. In short: confidentiality and
 //! integrity against attackers with read/write access to the stored files,
-//! as long as the password remains secret. The tool does not hide file sizes
-//! beyond filename padding, does not provide plausible deniability, and — as
-//! with all password-based encryption — security ultimately rests on password
-//! strength.
+//! as long as the password remains secret.
+//!
+//! The default (L1) hides names and directory structure but leaves entry
+//! counts and exact sizes observable. Opt-in size padding raises this to
+//! L2+ by bucketing file sizes; it does not hide access patterns or timing,
+//! and Keres does not claim full metadata protection. It provides no
+//! plausible deniability, and — as with all password-based encryption —
+//! security ultimately rests on password strength.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

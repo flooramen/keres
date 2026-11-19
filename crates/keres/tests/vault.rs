@@ -686,6 +686,193 @@ fn padding_round_trips_through_vault() {
     assert_eq!(v.padding().unwrap(), Padding::fixed(8192).unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+fn remove_commits_the_index_before_deleting_blobs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, mut v) = make_vault("removeorder");
+    let src = dir.path().join("gone.txt");
+    std::fs::write(&src, b"bye").unwrap();
+    v.add(&src, None).unwrap();
+
+    let blobs = walk_blobs(&v.path().join("d"));
+    assert_eq!(blobs.len(), 1);
+    let shard = blobs[0].parent().unwrap().to_path_buf();
+
+    // Make the blob's shard directory unwritable so unlinking fails, while the
+    // index log (written under `d/`) still succeeds.
+    let mut perms = std::fs::metadata(&shard).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&shard, perms).unwrap();
+
+    // The entry must disappear even though its blob could not be removed.
+    v.remove("gone.txt").unwrap();
+    assert!(v.list().unwrap().is_empty());
+
+    // Restore permissions; the leftover blob is a reclaimable orphan.
+    let mut perms = std::fs::metadata(&shard).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(&shard, perms).unwrap();
+    assert_eq!(v.prune_orphans().unwrap(), 1);
+}
+
+#[test]
+fn failed_batch_leaves_the_index_unchanged() {
+    let (dir, mut v) = make_vault("batchfail");
+    let a = dir.path().join("a.txt");
+    std::fs::write(&a, b"original").unwrap();
+    v.add(&a, None).unwrap();
+    let before = v.version().unwrap();
+    let blobs_before = walk_blobs(&v.path().join("d"));
+
+    // A replace writes a fresh copy-on-write blob, then a later failing
+    // operation must leave both the index and the visible contents untouched.
+    let b = dir.path().join("b.txt");
+    std::fs::write(&b, b"new content").unwrap();
+    let result = v.apply_batch(&[
+        BatchOp::Replace {
+            source: b,
+            name: "a.txt".into(),
+        },
+        BatchOp::Remove {
+            name: "missing.txt".into(),
+        },
+    ]);
+    assert!(matches!(result, Err(Error::EntryNotFound(_))));
+
+    assert_eq!(v.version().unwrap(), before);
+    let out = dir.path().join("out.txt");
+    v.extract("a.txt", &out).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"original");
+
+    // The failed replace's blob is an orphan; pruning restores the original
+    // blob set exactly.
+    assert!(v.prune_orphans().unwrap() >= 1);
+    assert_eq!(walk_blobs(&v.path().join("d")), blobs_before);
+}
+
+#[test]
+fn missing_manifest_is_not_treated_as_an_empty_index() {
+    let (dir, mut v) = make_vault("nomanifest");
+    let src = dir.path().join("f.txt");
+    std::fs::write(&src, b"x").unwrap();
+    v.add(&src, None).unwrap();
+
+    std::fs::remove_file(v.path().join("d").join(".manifest.enc")).unwrap();
+
+    assert!(matches!(v.list(), Err(Error::InvalidVault)));
+    assert!(matches!(v.version(), Err(Error::InvalidVault)));
+    assert!(matches!(
+        v.verify("master-password"),
+        Err(Error::InvalidVault)
+    ));
+}
+
+#[test]
+fn init_refuses_to_clobber_a_config_less_recovery_vault() {
+    let (_dir, mut v) = make_vault("initrecovery");
+    v.create_recovery_kit("master-password").unwrap();
+    std::fs::remove_file(v.path().join("vault.config")).unwrap();
+
+    assert!(matches!(v.init("other-password"), Err(Error::VaultExists)));
+    assert!(
+        v.path().join("vault.recovery").is_file(),
+        "the recovery kit must survive the refused re-init"
+    );
+}
+
+#[test]
+fn nested_root_names_are_rejected() {
+    let (dir, mut v) = make_vault("nestedroot");
+    let src = dir.path().join("f.txt");
+    std::fs::write(&src, b"x").unwrap();
+
+    assert!(matches!(
+        v.add(&src, Some("a/b.txt")),
+        Err(Error::InvalidEntryName(_))
+    ));
+    assert!(matches!(
+        v.add_if(&src, Some("a/b.txt"), None),
+        Err(Error::InvalidEntryName(_))
+    ));
+
+    v.add(&src, Some("a.txt")).unwrap();
+    assert!(matches!(
+        v.rename("a.txt", "b/c.txt"),
+        Err(Error::InvalidEntryName(_))
+    ));
+    assert_eq!(v.list().unwrap()[0].name, "a.txt");
+}
+
+#[test]
+fn re_adding_a_tree_fails_without_writing_blobs() {
+    let (dir, mut v) = make_vault("treepreflight");
+    let tree = dir.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("sub/file.txt"), b"nested").unwrap();
+    v.add(&tree, None).unwrap();
+    let blobs_before = walk_blobs(&v.path().join("d"));
+
+    assert!(matches!(v.add(&tree, None), Err(Error::EntryExists(_))));
+    assert_eq!(walk_blobs(&v.path().join("d")), blobs_before);
+
+    let out = dir.path().join("restored");
+    v.extract("tree", &out).unwrap();
+    assert_eq!(std::fs::read(out.join("sub/file.txt")).unwrap(), b"nested");
+}
+
+#[test]
+fn failed_erase_leaves_the_entry_and_old_password_intact() {
+    let (dir, mut v) = make_vault("erasefail");
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, b"secret").unwrap();
+    v.add(&secret, None).unwrap();
+    let keep = dir.path().join("keep.txt");
+    std::fs::write(&keep, b"keep").unwrap();
+    v.add(&keep, None).unwrap();
+
+    let blobs = walk_blobs(&v.path().join("d"));
+    assert_eq!(blobs.len(), 2);
+    let originals: Vec<_> = blobs.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    // Corrupt every blob so rotation of the survivor must fail.
+    for path in &blobs {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[40] ^= 0xFF;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    let vault_path = v.path().to_path_buf();
+    assert!(v.erase("secret.txt", "new-password").is_err());
+    drop(v);
+
+    // Restore the pre-erase ciphertext; the vault (including the entry that
+    // was supposed to be erased) must still be usable under the old password.
+    for (path, bytes) in blobs.iter().zip(originals) {
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    let mut reopened = Vault::new(vault_path);
+    reopened.unlock("master-password").unwrap();
+    let names: Vec<_> = reopened
+        .list()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.contains(&"secret.txt".to_string()));
+    assert!(names.contains(&"keep.txt".to_string()));
+
+    let out = dir.path().join("secret-out.txt");
+    reopened.extract("secret.txt", &out).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"secret");
+
+    assert!(Vault::new(reopened.path().to_path_buf())
+        .unlock("new-password")
+        .is_err());
+}
+
 #[test]
 fn orphaned_compaction_staging_is_cleaned_up() {
     let (_d, mut v) = make_vault("stagedlog");

@@ -64,12 +64,13 @@ pub(crate) fn run(vault_dir: &Path, master: &Key) -> Result<MigrationReport> {
             original_size: old.original_size,
             is_directory: old.is_directory,
             children: old.children.clone(),
+            content_hash: None,
         };
 
         if old.is_directory {
             // Authenticate the placeholder before replacing it.
             read_legacy_entry(vault_dir, master, path, true, |_| Ok(()))?;
-            blobs::write_entry_from_reader(
+            let (_, hash, _) = blobs::write_entry_from_reader(
                 vault_dir,
                 master,
                 &meta.id,
@@ -79,9 +80,11 @@ pub(crate) fn run(vault_dir: &Path, master: &Key) -> Result<MigrationReport> {
                 None,
             )?;
             meta.original_size = 0;
+            meta.content_hash = Some(hash);
         } else {
-            let size = copy_file(vault_dir, master, path, &meta)?;
+            let (size, hash) = copy_file(vault_dir, master, path, &meta)?;
             meta.original_size = size;
+            meta.content_hash = Some(hash);
             report.bytes += size;
         }
 
@@ -111,10 +114,10 @@ fn copy_file(
     master: &Key,
     legacy_path: &str,
     meta: &EntryMetadata,
-) -> Result<u64> {
+) -> Result<(u64, String)> {
     let (tx, rx) = mpsc::sync_channel::<Zeroizing<Vec<u8>>>(4);
 
-    std::thread::scope(|scope| -> Result<u64> {
+    std::thread::scope(|scope| -> Result<(u64, String)> {
         // `move` is essential: the sender must be dropped when the producer
         // finishes so the reader sees end-of-stream.
         let producer = scope.spawn(move || -> Result<u64> {
@@ -144,8 +147,12 @@ fn copy_file(
 
         // Prefer the write error; a read error means the source failed
         // authentication, in which case nothing was committed.
-        write?;
-        read
+        let (_, hash, written) = write?;
+        let read = read?;
+        if written != read {
+            return Err(Error::Authentication);
+        }
+        Ok((read, hash))
     })
 }
 
@@ -270,6 +277,7 @@ mod tests {
                     original_size: data.map(|b| b.len() as u64).unwrap_or(0),
                     is_directory: data.is_none(),
                     children: None,
+                    content_hash: None,
                 },
             );
         }

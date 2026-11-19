@@ -1,6 +1,6 @@
 # Keres
 
-Local-first, metadata-private encryption for files, vaults, and developer
+Local-first, metadata-hardened encryption for files, vaults, and developer
 secrets. One Rust workspace: engine, CLI, and documentation.
 
 [Documentation](docs/src/intro.md) · [Security](SECURITY.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md)
@@ -38,7 +38,7 @@ Run `keres help` for the full command list.
 
 ```toml
 [dependencies]
-keres = "0.4"
+keres = "0.6"
 ```
 
 ```rust
@@ -97,8 +97,10 @@ package dry-runs, and builds the documentation book.
 Keres is pre-1.0. The container format is versioned and documented, but the
 public API may change. The project has not yet had an independent security
 audit. See [SECURITY.md](SECURITY.md) for the threat model, guarantees, and
-known limitations — including the fact that entry counts, directory shape,
-and approximate file sizes are still observable.
+known limitations. Names and directory structure are always encrypted, but
+entry counts and exact file sizes remain observable by default. Opt-in size
+padding (`--padding` / `Padding`) hides exact sizes behind buckets; it does
+not hide access patterns, so Keres does not claim full metadata protection.
 
 ## License
 

@@ -72,7 +72,7 @@ offset  size                     field
 ────────────────────────────────────────────────────────────────
 0       8    "KERES\0\0\0"          magic (NUL is a control byte:
                                   cannot occur in plain text)
-8       2    u16 LE               envelope version (currently 1)
+8       2    u16 LE               envelope version (1, or 2 with size padding)
 10      1    kind                 0 = HKDF-from-master
                                   1 = password-derived
 11      32   (kind 0)             object_salt
@@ -138,7 +138,8 @@ manifest and never changes, so the blob location and AAD are independent of
 the entry's mutable path. This closes the *blob-transplant* attack class
 entirely: an attacker who swaps two blobs in the vault directory gets
 `Corrupted` reports from `verify()` and errors on extract — never silently
-wrong content.
+wrong content. The authenticated index also records the plaintext SHA-256, so
+replaying an older valid blob under the same entry ID is rejected too.
 
 ### Payload types
 
@@ -358,7 +359,8 @@ containing the new config (already wrapped) and the SHA-256 of the staged
 manifest — never a plaintext key:
 
 ```json
-{"version": 1, "manifest_sha256": "..64 hex..", "config": "{..v3 config..}"}
+{"version": 1, "manifest_sha256": "..64 hex..",
+ "config": "{..v3 config..}", "old_blobs": ["d/ab/cd....enc", "..."]}
 ```
 
 The journal write is the commit point. After it, the staged manifest is
@@ -371,9 +373,17 @@ If neither manifest matches, the rotation is rolled back and the journal is
 discarded. Before the journal exists, the old vault is untouched and the
 staged blobs are ordinary orphans for `prune_orphans`.
 
-Old blobs are unreachable under the new master; rotation removes them
-best-effort after the swap, and any leftovers are reclaimed by
+`old_blobs` lists the old-key ciphertext paths so recovery can delete them
+even though the old master is no longer available. Only paths under `d/`
+ending in `.enc` (other than `.manifest.enc`) are accepted. Rotation removes
+them best-effort after the swap, and any leftovers are reclaimed by
 `verify --prune`.
+
+`Vault::erase` reuses this machinery: the entry to erase is added to the
+rotation's removed set, so omission and re-encryption commit together. If
+rotation fails, the old vault (including the entry) is left intact. Erasure
+invalidates the old master key going forward; it is not retroactive
+crypto-erasure of a blob an attacker already copied.
 
 ### Blob locations
 
@@ -392,7 +402,10 @@ encrypted index; no ciphertext is re-encrypted.
 
 The logical index is a `BTreeMap<String, EntryMetadata>` serialized to JSON.
 Each `EntryMetadata` records a non-empty 128-bit hex `id`, the original name,
-size, directory flag, and child lists for directories.
+size, directory flag, child lists for directories, and an optional SHA-256 of
+the plaintext (`content_hash`). The hash binds a blob to the exact contents
+the index recorded; it is `None` for entries written by releases before the
+field existed, which are size-checked only.
 
 The index is stored in two parts:
 
@@ -447,11 +460,11 @@ are the root of blob identity, so a missing one cannot be repaired safely).
 re-encrypts every entry under a fresh ID, then commits the v3 snapshot
 atomically. A failure before that commit leaves the legacy manifest intact.
 
-Load semantics (hardened after audit finding #1):
+Load semantics:
 
 | State | Result |
 |---|---|
-| Snapshot and log absent | empty index (fresh/uninitialized data dir) |
+| Snapshot absent | **error** — only `init` creates the first snapshot; treating it as empty would drop every record on the next save |
 | Snapshot present but damaged/truncated/unauthentic | **error** — never silently empty |
 | Log present but snapshot absent, or bound to another snapshot/generation | **error** |
 | Snapshot larger than the 64 MiB read cap | rejected before allocation |
@@ -460,28 +473,32 @@ Load semantics (hardened after audit finding #1):
 
 | API | Behavior notes |
 |---|---|
-| `init(pw)` | creates dir mode 0700, config, empty index snapshot |
+| `init(pw)` | creates dir mode 0700 and the empty index snapshot, then writes the config; refuses to clobber a config-less vault that still has a recovery kit |
 | `unlock` / `lock` | unwraps master into memory / drops it |
-| `add(src, name)` | validates target name, rejects collisions & separators; directories recurse, creating placeholder entries; every blob temp+rename; index batch appended last |
-| `replace(src, name)` | rewrites one existing file blob and appends a new index record; directory entries are rejected |
-| `rename(from, to)` | top-level only; appends `put` records for the new keys and child lists (for directories, the whole subtree) without touching ciphertext |
+| `add(src, name)` | validates a single-component root name (no separators), rejects collisions; directories pre-flight every destination before writing; every blob temp+rename; index batch appended last |
+| `replace(src, name)` | writes a fresh blob under a new entry ID (copy-on-write), appends the index record, then deletes the old blob; directory entries are rejected |
+| `rename(from, to)` | top-level only; pre-checks every destination in a moved subtree; appends `put` records for the new keys and child lists without touching ciphertext |
+| `add_if` / `replace_if` | conditional variants; return `WriteOutcome` and `Error::Conflict` without modifying the vault when the precondition fails |
+| `apply_batch(ops)` | adds/replaces write fresh IDs, removes only drop index records, then one index commit; old blobs are deleted after the commit |
 | `list()` | reads snapshot + log only — no blobs touched, fast |
-| `extract(name, dest)` | recreates hierarchy; names sanitized; outputs via temp+rename |
-| `remove(name)` | removes subtree blobs and appends `delete` records (no orphans from successful ops) |
+| `extract(name, dest)` | recreates hierarchy; names sanitized; verifies size and content hash; outputs via temp+rename |
+| `remove(name)` | drops subtree index records and commits, then deletes blobs best-effort (a failed deletion leaves a pruneable orphan, never a dangling index) |
+| `erase(name,new_pw)` | omits the subtree and performs a deep rotation in one journaled commit; on failure the old vault and entry remain |
 | `change_password(old,new)` | verifies old, re-wraps only that keyslot; ciphertext and other slots untouched |
 | `rotate(old,new)` | deep rotation: fresh master key, all blobs re-encrypted, snapshot rewritten and the old log removed; collapses to one keyslot, removes the recovery kit, leaves the vault locked; crash-safe via `vault.rotate` |
 | `keyslots()` | lists plaintext slot ids; no password required |
 | `add_keyslot(existing,new)` | verifies an existing passphrase and appends an independent slot; upgrades a legacy config |
 | `remove_keyslot(id,pw)` | revokes a slot, authorized by a passphrase from a slot that remains; the last slot is refused |
-| `verify(pw)` | decrypts every blob (type-checked), cross-checks the replayed index; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
+| `verify(pw)` | decrypts every blob (type-checked), checks size and content hash against the replayed index; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
 | `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no replayed index record references; refuses if the snapshot is missing |
 | `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the snapshot atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |
 | `create_recovery_kit(pw)` | verifies the password, writes `vault.recovery`, returns a one-time printable `RecoveryCode` |
 | `recover(code,new_pw)` | unwraps the master with the code, validates it against the index, re-wraps the config, consumes the kit |
 
-Directory removal walks the manifest's own child lists, so removing a
-directory removes everything beneath it even if nested names were added
-out of order.
+Directory removal walks the manifest's own child lists (and the `/`-prefixed
+range, so a stale child list cannot strand descendants), so removing a
+directory removes everything beneath it even if nested names were added out of
+order.
 
 ### Path-traversal defense
 
@@ -507,9 +524,21 @@ Invariants: a crash may lose the *current* operation, never corrupt
 - Failure mid-add leaves unreferenced blobs (index batch not yet appended) —
   visible to nobody, and reclaimed by `verify --prune` /
   `Vault::prune_orphans`.
+- Replaces are copy-on-write: a fresh blob and entry ID are written, the index
+  is committed, and only then is the old blob deleted. A failed replace leaves
+  the previous version fully readable.
+- Removals commit the index first and delete blobs afterwards, so a deletion
+  failure can leave an orphan but never an index that points at missing data.
+- `apply_batch` writes all new blobs and computes the final index in memory
+  before its single commit. A failure at any point leaves the index unchanged;
+  fresh blobs become pruneable orphans.
 - Deep rotation commits through `vault.rotate` before touching the canonical
   index, so an interrupted run is either rolled back or completed on the next
-  open. A staged `.manifest.enc.next` without a journal is ignored.
+  open. The journal lists old-key blobs so recovery can delete them too. A
+  staged `.manifest.enc.next` without a journal is ignored.
+- `erase` is a rotation with a removed set: the entry is omitted from the new
+  index and survivors are re-encrypted before the commit. A failure leaves the
+  old vault (including the entry) intact.
 - Index compaction commits through `d/.index.compact` before the snapshot/log
   swap. An interrupted run promotes or discards the staged pair on the next
   lock acquisition; staged files without a journal are deleted.
@@ -546,7 +575,9 @@ One enum (`Error`, thiserror), `Result<T> = std::result::Result<T, Error>`:
 | `VaultBusy` | another process holds the vault lock |
 | `Cancelled` | a streaming operation was stopped by its cancellation flag |
 | `EntryExists` / `EntryNotFound` | name conflicts |
-| `InvalidName(String)` | validation failure (preview truncated to 32 chars) |
+| `Conflict` | a conditional write's precondition failed; the vault was not modified |
+| `InvalidEntryName(String)` | validation failure (preview truncated to 32 chars) |
+| `Operation(String)` | user-level operation could not be performed |
 | `Io(std::io::Error)` | filesystem layer |
 | `Encryption` / `KeyDerivation` / `InvalidKdfParams` / `MalformedPayload` | internal/crypto-layer failures |
 

@@ -15,7 +15,7 @@ and coercion of the password itself.
     | AES-256-GCM | AEAD for all ciphertext (chunks, trailers, manifests, index-log records, wrapped keys) |
     | Argon2id (64 MiB, t=4, p=4) | Password → KEK; parameters serialized per container |
     | HKDF-SHA256 | Master key → per-object subkeys; manifest and index-log key derivation |
-    | SHA-256 | Blob path derivation (`SHA256(master ‖ path)`), verification hash |
+    | SHA-256 | Blob path derivation (`SHA256(master ‖ entry_id)`), per-entry plaintext content hash, verification hash |
 
 ### Nonces
 
@@ -84,8 +84,9 @@ exfiltrated.
 - Names read back from containers are sanitized before path joins;
   absolute paths, `..`, separators and control characters are rejected —
   a malicious vault archive cannot write outside its directory.
-- Directory removal walks the encrypted manifest's child lists, so removing
-  a tree leaves no orphaned blobs.
+- Removal commits the index first and deletes blobs afterwards. A crash or
+  deletion failure between the two leaves unreferenced blobs (reclaimed by
+  `prune_orphans`), never an index pointing at missing data.
 - Vault access is serialized with an advisory lock on `vault.lock`: writers
   take it exclusively, readers share it, and a contended operation returns
   `Error::VaultBusy`. The lock is not a security boundary against a process
@@ -121,7 +122,10 @@ Rules that keep this stable:
 
 `Vault::verify()` authenticates every blob and the replayed index (snapshot
 plus log), reporting a per-entry integrity report without writing plaintext to
-disk.
+disk. Beyond AEAD tags it checks the plaintext size and the SHA-256 content
+hash recorded in the authenticated index, so a storage attacker cannot swap in
+an older valid blob for the same entry ID. Entries written by releases before
+content hashes existed are size-checked only.
 
 ## Recovery Kit
 
@@ -178,8 +182,11 @@ ids and the slot count are plaintext metadata in `vault.config`.
    `encrypt_file_with_padding` / CLI `--padding`); L1 remains the default.
 6. **Trust on first unlock** — the config stores a verification hash rather
    than a signature; there is no protection against full-storage rollback to
-   an older valid vault snapshot. Truncating the tail of the index log is
-   likewise indistinguishable from an interrupted append.
+   an older valid vault snapshot. The index's internal generation makes
+   snapshot/log swaps unambiguous, and per-entry content hashes detect a
+   substituted blob for the same entry, but neither is a hardware-backed
+   anti-rollback counter. Truncating the tail of the index log is likewise
+   indistinguishable from an interrupted append.
 7. **Operation-pattern leakage** — the index log's record count, size, and
    approximate write order reveal how many mutations happened and roughly
    when. Entry sizes may be bucketed when padding is enabled, but access
@@ -203,7 +210,7 @@ the caveats below.
 | Access patterns (read/write order, frequency) | Visible | Visible | Not hidden; needs ORAM (out of scope). |
 | Modification times | OS-level (visible) | OS-level (visible) | Not coarsened. |
 | Index mutation count / order | Visible via log size | Visible via log size | Group commit (timing coarsening) is future work. |
-| Deleted-entry recoverability | Blob removed on `remove` | Blob removed; old copies decryptable unless `erase` | `erase` rotates the master key. |
+| Deleted-entry recoverability | Blob removed on `remove` | Blob removed; old copies decryptable unless `erase` | `erase` rotates the master key (forward invalidation, not retroactive). |
 | Rollback to older snapshot | Possible (no signatures) | Possible | Hardware-backed counter is optional/future. |
 
 ### Caveats
@@ -211,8 +218,11 @@ the caveats below.
 - Padding hides the exact size, not the access pattern. An observer who sees
   *which* blob is read still learns which entry was used.
 - `remove` drops the blob and index record but leaves the data decryptable by
-  anyone holding an old master key or snapshot. Use `Vault::erase` (or
-  `Vault::rotate` after removal) to invalidate that key material.
+  anyone holding an old master key or snapshot. `Vault::erase` omits the entry
+  and rotates the master key in one journaled commit, so the old key stops
+  working against the vault from then on. This is forward-looking: it cannot
+  revoke a copy of the deleted blob that an attacker already captured together
+  with the old key material.
 - Group commit and timing jitter are not yet implemented; mutations are
   flushed per save.
 

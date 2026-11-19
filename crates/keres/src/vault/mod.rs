@@ -256,16 +256,18 @@ impl Vault {
         if self.exists() {
             return Err(Error::VaultExists);
         }
+        // A config-less vault with a recovery kit is recoverable with
+        // `Vault::recover`; never clobber it by re-initializing.
+        if self.path.join("vault.recovery").is_file() {
+            return Err(Error::VaultExists);
+        }
 
         let config = self.keystore.init(password)?;
+        // Write the index before the config. A crash in between leaves no
+        // config, so `init` can be retried safely; the reverse order would
+        // leave an initialized-looking vault whose index is missing.
+        manifest::init(&self.path, self.keystore.master_key()?, padding)?;
         self.write_config(&config)?;
-
-        manifest::save(
-            &self.path,
-            &ManifestMap::new(),
-            self.keystore.master_key()?,
-            padding,
-        )?;
         Ok(())
     }
 
@@ -321,7 +323,7 @@ impl Vault {
                 .map(|n| n.to_string_lossy().to_string())
                 .ok_or_else(|| Error::invalid_name(source.display()))?,
         };
-        sanitize::validate_new_name(&root_name)?;
+        sanitize::validate_root_name(&root_name)?;
 
         let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
         let (gen, records) = manifest::current_version(&self.path, &master)?;
@@ -346,11 +348,18 @@ impl Vault {
             let meta = EntryMetadata {
                 id: id.clone(),
                 original_name: root_name.clone(),
-                original_size: fs::metadata(&source)?.len(),
+                original_size: 0,
                 is_directory: false,
                 children: None,
+                content_hash: None,
             };
-            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+            let (_, hash, size) =
+                blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+            let meta = EntryMetadata {
+                original_size: size,
+                content_hash: Some(hash),
+                ..meta
+            };
             all.insert(root_name.clone(), meta);
         }
 
@@ -409,18 +418,28 @@ impl Vault {
                 "cannot replace a directory entry; remove it first".into(),
             ));
         }
-        let id = existing.id.clone();
+        // Copy-on-write, as in `replace`.
+        let old_id = existing.id.clone();
+        let id = new_entry_id();
 
         let meta = EntryMetadata {
             id: id.clone(),
             original_name: name.to_string(),
-            original_size: fs::metadata(&source)?.len(),
+            original_size: 0,
             is_directory: false,
             children: None,
+            content_hash: None,
         };
-        blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+        let (_, hash, size) =
+            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+        let meta = EntryMetadata {
+            original_size: size,
+            content_hash: Some(hash),
+            ..meta
+        };
         all.insert(name.to_string(), meta);
         manifest::save(&self.path, &all, &master, padding)?;
+        let _ = blobs::remove_blob(&self.path, &master, &old_id);
         let (gen2, records2) = manifest::current_version(&self.path, &master)?;
         Ok(WriteOutcome::Applied {
             version: IndexVersion {
@@ -531,7 +550,7 @@ impl Vault {
                 .map(|n| n.to_string_lossy().to_string())
                 .ok_or_else(|| Error::invalid_name(source.display()))?,
         };
-        sanitize::validate_new_name(&root_name)?;
+        sanitize::validate_root_name(&root_name)?;
 
         let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
         if all.contains_key(&root_name) {
@@ -547,11 +566,18 @@ impl Vault {
             let meta = EntryMetadata {
                 id: id.clone(),
                 original_name: root_name.clone(),
-                original_size: fs::metadata(&source)?.len(),
+                original_size: 0,
                 is_directory: false,
                 children: None,
+                content_hash: None,
             };
-            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+            let (_, hash, size) =
+                blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+            let meta = EntryMetadata {
+                original_size: size,
+                content_hash: Some(hash),
+                ..meta
+            };
             all.insert(root_name.clone(), meta);
         }
 
@@ -594,18 +620,29 @@ impl Vault {
                 "cannot replace a directory entry; remove it first".into(),
             ));
         }
-        let id = existing.id.clone();
+        // Copy-on-write: the old blob stays untouched until the index commits.
+        // A failed save therefore leaves the previous version fully readable.
+        let old_id = existing.id.clone();
+        let id = new_entry_id();
 
         let meta = EntryMetadata {
             id: id.clone(),
             original_name: name.to_string(),
-            original_size: fs::metadata(&source)?.len(),
+            original_size: 0,
             is_directory: false,
             children: None,
+            content_hash: None,
         };
-        blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+        let (_, hash, size) =
+            blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
+        let meta = EntryMetadata {
+            original_size: size,
+            content_hash: Some(hash),
+            ..meta
+        };
         all.insert(name.to_string(), meta);
         manifest::save(&self.path, &all, &master, padding)?;
+        let _ = blobs::remove_blob(&self.path, &master, &old_id);
         Ok(())
     }
 
@@ -624,8 +661,8 @@ impl Vault {
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         let master = self.require_unlocked()?;
         let _lock = self.lock_exclusive()?;
-        sanitize::validate_new_name(from)?;
-        sanitize::validate_new_name(to)?;
+        sanitize::validate_root_name(from)?;
+        sanitize::validate_root_name(to)?;
         if from == to {
             return Ok(());
         }
@@ -651,6 +688,21 @@ impl Vault {
             }
         }
         moves.push((from.to_string(), original));
+
+        // Pre-flight every destination so a collision in the moved subtree
+        // cannot overwrite an unrelated entry halfway through the rewrite.
+        let old_keys: std::collections::HashSet<&str> =
+            moves.iter().map(|(path, _)| path.as_str()).collect();
+        for (path, _) in &moves {
+            let new_path = if path == from {
+                to.to_string()
+            } else {
+                format!("{new_prefix}{}", &path[old_prefix.len()..])
+            };
+            if !old_keys.contains(new_path.as_str()) && all.contains_key(&new_path) {
+                return Err(Error::EntryExists(new_path));
+            }
+        }
 
         // Remove every old key first so inserting new ones cannot collide with
         // a stale subtree entry.
@@ -683,9 +735,14 @@ impl Vault {
 
     /// Removes an entry (and, for directories, its whole subtree).
     ///
-    /// Both the ciphertext blobs and their manifest records are deleted.
-    /// Copies of the blob made under the old master key remain decryptable
-    /// by anyone holding that key; use [`Vault::erase`] for crypto-erasure.
+    /// The index commit happens first; blobs are deleted only after it
+    /// succeeds. A crash or I/O failure between the two leaves unreferenced
+    /// blobs (reclaimable with [`Vault::prune_orphans`]), never an index that
+    /// points at missing data.
+    ///
+    /// Copies of the blob made under the old master key remain decryptable by
+    /// anyone holding that key; use [`Vault::erase`] to invalidate the old
+    /// master going forward.
     pub fn remove(&mut self, name: &str) -> Result<()> {
         let master = self.require_unlocked()?;
         let _lock = self.lock_exclusive()?;
@@ -696,42 +753,55 @@ impl Vault {
             return Err(Error::EntryNotFound(preview(name)));
         }
 
-        remove_subtree(&self.path, &master, name, &mut all);
+        let removed_ids = remove_subtree(&mut all, name);
         manifest::save(&self.path, &all, &master, padding)?;
+        for id in removed_ids {
+            let _ = blobs::remove_blob(&self.path, &master, &id);
+        }
         Ok(())
     }
 
-    /// Removes an entry and then re-encrypts every survivor under a fresh
-    /// master key, so copies of the deleted entry made under the old master
-    /// can no longer be decrypted.
+    /// Removes an entry and re-encrypts every survivor under a fresh master
+    /// key, so the old master key can no longer decrypt the vault.
     ///
-    /// This is the crypto-erasure path: ordinary [`Vault::remove`] only drops
-    /// the blob and index record, leaving the data readable by anyone who
-    /// captured the old master key or an old snapshot. `erase` pays the cost of
-    /// a full rotation to invalidate that key material. The vault ends up
-    /// locked under `new_password`; extra keyslots and any recovery kit are
-    /// dropped, as with [`Vault::rotate`].
+    /// This is a single journaled rotation: the entry is omitted from the new
+    /// index and every survivor is re-encrypted before the commit. If rotation
+    /// fails, the old vault (including the entry) is left intact.
+    ///
+    /// Crypto-erasure is *forward-looking*. Anyone who already captured the
+    /// deleted blob together with an old `vault.config` or the old master key
+    /// can still decrypt that copy; `erase` prevents that key material from
+    /// being used against the vault from now on. It is not retroactive
+    /// revocation of leaked keys.
+    ///
+    /// The vault ends up locked under `new_password`; extra keyslots and any
+    /// recovery kit are dropped, as with [`Vault::rotate`].
     pub fn erase(&mut self, name: &str, new_password: &str) -> Result<RotationReport> {
         let old_master = self.require_unlocked()?;
         let _lock = self.lock_exclusive()?;
         sanitize::validate_new_name(name)?;
 
-        // Phase 1: drop the entry (blob + index record) under the old master.
-        let (mut all, padding) = manifest::load_with_padding(&self.path, &old_master)?;
+        // Plan the removal without committing anything: rotation writes the
+        // survivors under the new master and omits these names from the new
+        // index, so a failure leaves the old vault untouched.
+        let (all, _padding) = manifest::load_with_padding(&self.path, &old_master)?;
         if !all.contains_key(name) {
             return Err(Error::EntryNotFound(preview(name)));
         }
-        remove_subtree(&self.path, &old_master, name, &mut all);
-        manifest::save(&self.path, &all, &old_master, padding)?;
+        let removed = collect_subtree_names(&all, name);
 
-        // Phase 2: rotate the master key so the old one (which could still
-        // decrypt a captured copy of the deleted blob) is invalidated. Only
-        // survivors are re-encrypted.
         let config = self.load_config()?;
         let discarded = config.slot_ids().len().saturating_sub(1);
         let new_master = Key::generate();
         let new_config = VaultConfig::new(&new_master, new_password)?;
-        let report = rotation::run(&self.path, &old_master, &new_master, &new_config, discarded)?;
+        let report = rotation::run(
+            &self.path,
+            &old_master,
+            &new_master,
+            &new_config,
+            discarded,
+            &removed,
+        )?;
 
         self.keystore.lock();
         Ok(report)
@@ -780,7 +850,7 @@ impl Vault {
             .clone();
 
         if !meta.is_directory {
-            stream_blob_to_file(&self.path, &master, &meta.id, dest, false)?;
+            stream_blob_to_file(&self.path, &master, &meta, dest)?;
             return Ok(dest.to_path_buf());
         }
 
@@ -798,7 +868,7 @@ impl Vault {
             if child_meta.is_directory {
                 crate::fsutil::create_private_dir(&target)?;
             } else {
-                stream_blob_to_file(&self.path, &master, &child_meta.id, &target, false)?;
+                stream_blob_to_file(&self.path, &master, child_meta, &target)?;
             }
         }
         Ok(dest.to_path_buf())
@@ -1059,6 +1129,7 @@ impl Vault {
             &new_master,
             &new_config,
             discarded_keyslots,
+            &std::collections::HashSet::new(),
         )?;
 
         // The in-memory key is stale by construction.
@@ -1068,15 +1139,19 @@ impl Vault {
 
     /// Applies a batch of mutations in a single commit.
     ///
-    /// Blobs are written first, then the index is committed once, so a
-    /// multi-entry update costs one fsync instead of one per entry. On
-    /// conflict or error nothing is committed (already-written blobs become
-    /// orphans reclaimable by [`Vault::prune_orphans`]).
+    /// Adds and replaces write fresh blob IDs, and removes only drop index
+    /// records, so nothing the current index references is touched until the
+    /// single commit succeeds. If any operation fails, the index is unchanged
+    /// and freshly written blobs are orphans reclaimable with
+    /// [`Vault::prune_orphans`]. Old blobs are deleted only after the commit.
     pub fn apply_batch(&mut self, ops: &[BatchOp]) -> Result<()> {
         let master = self.require_unlocked()?;
         let _lock = self.lock_exclusive()?;
 
         let (mut all, padding) = manifest::load_with_padding(&self.path, &master)?;
+        let original_ids: std::collections::HashSet<String> =
+            all.values().map(|meta| meta.id.clone()).collect();
+        let mut written_ids = std::collections::HashSet::new();
 
         for op in ops {
             match op {
@@ -1094,24 +1169,26 @@ impl Vault {
                             .map(|n| n.to_string_lossy().to_string())
                             .ok_or_else(|| Error::invalid_name(source.display()))?,
                     };
-                    sanitize::validate_new_name(&root_name)?;
+                    sanitize::validate_root_name(&root_name)?;
                     if all.contains_key(&root_name) {
                         return Err(Error::EntryExists(root_name));
                     }
                     if source.is_dir() {
-                        add_directory_tree(
+                        let created = add_directory_tree(
                             &self.path, &master, &source, &root_name, &mut all, padding,
                         )?;
+                        written_ids.extend(created);
                     } else {
                         let id = new_entry_id();
                         let meta = EntryMetadata {
                             id: id.clone(),
                             original_name: root_name.clone(),
-                            original_size: fs::metadata(&source)?.len(),
+                            original_size: 0,
                             is_directory: false,
                             children: None,
+                            content_hash: None,
                         };
-                        blobs::write_entry(
+                        let (_, hash, size) = blobs::write_entry(
                             &self.path,
                             &master,
                             &id,
@@ -1119,7 +1196,15 @@ impl Vault {
                             Some(&source),
                             padding,
                         )?;
-                        all.insert(root_name, meta);
+                        written_ids.insert(id);
+                        all.insert(
+                            root_name,
+                            EntryMetadata {
+                                original_size: size,
+                                content_hash: Some(hash),
+                                ..meta
+                            },
+                        );
                     }
                 }
                 BatchOp::Replace { source, name } => {
@@ -1139,31 +1224,61 @@ impl Vault {
                             "cannot replace a directory entry; remove it first".into(),
                         ));
                     }
-                    let id = existing.id.clone();
+                    // Copy-on-write: the old blob is untouched until commit.
+                    let id = new_entry_id();
                     let meta = EntryMetadata {
                         id: id.clone(),
                         original_name: name.clone(),
-                        original_size: fs::metadata(&source)?.len(),
+                        original_size: 0,
                         is_directory: false,
                         children: None,
+                        content_hash: None,
                     };
-                    blobs::write_entry(&self.path, &master, &id, &meta, Some(&source), padding)?;
-                    all.insert(name.clone(), meta);
+                    let (_, hash, size) = blobs::write_entry(
+                        &self.path,
+                        &master,
+                        &id,
+                        &meta,
+                        Some(&source),
+                        padding,
+                    )?;
+                    written_ids.insert(id);
+                    all.insert(
+                        name.clone(),
+                        EntryMetadata {
+                            original_size: size,
+                            content_hash: Some(hash),
+                            ..meta
+                        },
+                    );
                 }
                 BatchOp::Remove { name } => {
                     sanitize::validate_new_name(name)?;
                     if !all.contains_key(name) {
                         return Err(Error::EntryNotFound(preview(name)));
                     }
-                    remove_subtree(&self.path, &master, name, &mut all);
+                    // Only drop index records here; blobs go after the commit.
+                    let _ = remove_subtree(&mut all, name);
                 }
             }
         }
 
         manifest::save(&self.path, &all, &master, padding)?;
+
+        // The commit is durable; reclaim blobs the new index no longer
+        // references (old versions from replaces and removed subtrees).
+        let final_ids: std::collections::HashSet<String> =
+            all.values().map(|meta| meta.id.clone()).collect();
+        for id in original_ids.into_iter().chain(written_ids) {
+            if !final_ids.contains(&id) {
+                let _ = blobs::remove_blob(&self.path, &master, &id);
+            }
+        }
         Ok(())
     }
-    /// all chunk tags), reporting missing or corrupted items.
+
+    /// Verifies every entry's blobs (size, trailer, and all chunk tags),
+    /// reporting missing or corrupted items.
     ///
     /// Restores the prior lock state when done.
     ///
@@ -1208,7 +1323,10 @@ impl Vault {
         };
 
         for (name, meta) in all.iter() {
-            match blobs::read_entry(&self.path, &master, &meta.id, meta.is_directory, |_| Ok(())) {
+            // `read_entry_checked` verifies the trailer size and the
+            // authenticated content hash in addition to every chunk tag, so a
+            // substituted older blob is reported as corrupted.
+            match blobs::read_entry_checked(&self.path, &master, meta, |_| Ok(())) {
                 Ok(_) => report.verified += 1,
                 Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     report.missing.push(name.clone());
@@ -1286,6 +1404,9 @@ impl Drop for Vault {
 
 /// Adds a directory tree: one blob per file plus directory placeholders,
 /// with manifest child lists wired up for recursive removal.
+///
+/// Returns the entry IDs created by this call so a batch can reclaim them if a
+/// later operation fails.
 fn add_directory_tree(
     vault_dir: &Path,
     master: &Key,
@@ -1293,21 +1414,8 @@ fn add_directory_tree(
     vault_name: &str,
     all: &mut ManifestMap,
     padding: crate::padding::Padding,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     use walkdir::WalkDir;
-
-    // Insert the root placeholder first so children can register with it.
-    all.insert(
-        vault_name.to_string(),
-        EntryMetadata {
-            id: new_entry_id(),
-            original_name: vault_name.to_string(),
-            original_size: 0,
-            is_directory: true,
-            children: Some(Vec::new()),
-        },
-    );
-    let mut dir_paths: Vec<String> = vec![vault_name.to_string()];
 
     let entries: Vec<_> = WalkDir::new(source_root)
         .sort_by_file_name()
@@ -1315,11 +1423,15 @@ fn add_directory_tree(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|_| Error::invalid_name(source_root.display()))?;
 
-    // WalkDir yields parents before children, so each entry's parent record
-    // already exists here.
-    for entry in entries {
+    // Pre-flight every destination before writing a blob. A collision deep in
+    // the tree must fail the whole add rather than silently overwrite an
+    // existing entry or leave half a tree behind.
+    let mut planned = Vec::with_capacity(entries.len());
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(vault_name.to_string());
+    for entry in &entries {
         let ft = entry.file_type();
-        if ft.is_symlink() {
+        if ft.is_symlink() || (!ft.is_dir() && !ft.is_file()) {
             continue;
         }
         let rel = relative_entry_name(entry.path(), source_root)?;
@@ -1327,36 +1439,79 @@ fn add_directory_tree(
             continue;
         }
         sanitize::validate_new_name(&rel)?;
-
         let full = format!("{vault_name}/{rel}");
+        if all.contains_key(&full) || !seen.insert(full.clone()) {
+            return Err(Error::EntryExists(full));
+        }
+        planned.push((
+            full,
+            ft.is_dir(),
+            ft.is_file().then(|| entry.path().to_path_buf()),
+        ));
+    }
+
+    let mut created = Vec::new();
+
+    // Insert the root placeholder first so children can register with it.
+    let root_id = new_entry_id();
+    created.push(root_id.clone());
+    all.insert(
+        vault_name.to_string(),
+        EntryMetadata {
+            id: root_id,
+            original_name: vault_name.to_string(),
+            original_size: 0,
+            is_directory: true,
+            children: Some(Vec::new()),
+            content_hash: None,
+        },
+    );
+    let mut dir_paths: Vec<String> = vec![vault_name.to_string()];
+
+    // WalkDir yields parents before children, so each entry's parent record
+    // already exists here.
+    for (full, is_dir, source) in planned {
         let parent_full = full
             .rsplit_once('/')
             .map(|(p, _)| p.to_string())
             .ok_or(Error::InvalidVault)?;
 
-        if ft.is_dir() {
+        if is_dir {
+            let id = new_entry_id();
+            created.push(id.clone());
             all.insert(
                 full.clone(),
                 EntryMetadata {
-                    id: new_entry_id(),
+                    id,
                     original_name: full.clone(),
                     original_size: 0,
                     is_directory: true,
                     children: Some(Vec::new()),
+                    content_hash: None,
                 },
             );
             dir_paths.push(full.clone());
-        } else if ft.is_file() {
+        } else if let Some(source) = source {
             let id = new_entry_id();
             let meta = EntryMetadata {
                 id: id.clone(),
                 original_name: full.clone(),
-                original_size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+                original_size: 0,
                 is_directory: false,
                 children: None,
+                content_hash: None,
             };
-            blobs::write_entry(vault_dir, master, &id, &meta, Some(entry.path()), padding)?;
-            all.insert(full.clone(), meta);
+            let (_, hash, size) =
+                blobs::write_entry(vault_dir, master, &id, &meta, Some(&source), padding)?;
+            created.push(id);
+            all.insert(
+                full.clone(),
+                EntryMetadata {
+                    original_size: size,
+                    content_hash: Some(hash),
+                    ..meta
+                },
+            );
         }
 
         if let Some(pmeta) = all.get_mut(&parent_full) {
@@ -1366,20 +1521,23 @@ fn add_directory_tree(
         }
     }
 
-    // Persist directory placeholder blobs (only the ones from this call).
+    // Persist directory placeholder blobs (only the ones from this call) and
+    // record their content hashes.
     for dir_path in &dir_paths {
-        if let Some(meta) = all.get(dir_path) {
-            blobs::write_entry(
-                vault_dir,
-                master,
-                &meta.id,
-                meta,
-                None,
-                crate::padding::Padding::None,
-            )?;
+        let meta = all.get(dir_path).cloned().ok_or(Error::InvalidVault)?;
+        let (_, hash, _) = blobs::write_entry(
+            vault_dir,
+            master,
+            &meta.id,
+            &meta,
+            None,
+            crate::padding::Padding::None,
+        )?;
+        if let Some(stored) = all.get_mut(dir_path) {
+            stored.content_hash = Some(hash);
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Builds the vault-relative name for an entry below `root`, always using
@@ -1402,24 +1560,54 @@ fn relative_entry_name(path: &Path, root: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-/// Removes an entry subtree: blobs first, index records second.
-fn remove_subtree(vault_dir: &Path, master: &Key, name: &str, all: &mut ManifestMap) {
+/// Collects the names in an entry's subtree.
+///
+/// Child lists are authoritative, but a directory also seeds the scan from its
+/// `/`-prefixed range so a stale child list cannot strand descendants. A
+/// visited set makes a cyclic (malicious) index terminate.
+fn subtree_names(all: &ManifestMap, name: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     let mut stack = vec![name.to_string()];
-    let mut doomed = Vec::new();
+    if all.get(name).is_some_and(|meta| meta.is_directory) {
+        let prefix = format!("{name}/");
+        for (path, _) in all.range(prefix.clone()..) {
+            if !path.starts_with(&prefix) {
+                break;
+            }
+            stack.push(path.clone());
+        }
+    }
     while let Some(cur) = stack.pop() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
         if let Some(meta) = all.get(&cur) {
             if let Some(children) = &meta.children {
                 stack.extend(children.iter().cloned());
             }
         }
-        doomed.push(cur);
     }
-    for cur in doomed {
-        if let Some(meta) = all.get(&cur) {
-            let _ = blobs::remove_blob(vault_dir, master, &meta.id);
+    seen.into_iter().collect()
+}
+
+/// Removes an entry subtree from the in-memory index.
+///
+/// Returns the removed entry IDs; blobs are deleted by the caller only after
+/// the index commit succeeds.
+fn remove_subtree(all: &mut ManifestMap, name: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for entry_name in subtree_names(all, name) {
+        if let Some(meta) = all.remove(&entry_name) {
+            ids.push(meta.id);
         }
-        all.remove(&cur);
     }
+    ids
+}
+
+/// Names in an entry's subtree, for operations (such as `erase`) that must
+/// omit them from a new index without mutating the current one.
+fn collect_subtree_names(all: &ManifestMap, name: &str) -> std::collections::HashSet<String> {
+    subtree_names(all, name).into_iter().collect()
 }
 
 /// Joins a stored relative name onto `base`, refusing traversal attempts.
@@ -1429,12 +1617,14 @@ fn join_sanitized(base: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 /// Streams one blob's plaintext through a temp file onto `target`.
+///
+/// Uses [`blobs::read_entry_checked`], so extraction fails (and the temp file
+/// is removed) if the blob's size or content hash does not match the index.
 fn stream_blob_to_file(
     vault_dir: &Path,
     master: &Key,
-    entry_id: &str,
+    meta: &EntryMetadata,
     target: &Path,
-    is_directory: bool,
 ) -> Result<()> {
     let tmp = crate::fsutil::sibling_temp_path(target);
 
@@ -1442,7 +1632,7 @@ fn stream_blob_to_file(
         {
             let f = crate::fsutil::create_private_file(&tmp)?;
             let mut w = std::io::BufWriter::new(f);
-            blobs::read_entry(vault_dir, master, entry_id, is_directory, |chunk| {
+            blobs::read_entry_checked(vault_dir, master, meta, |chunk| {
                 w.write_all(chunk)?;
                 Ok(())
             })?;
@@ -1487,6 +1677,51 @@ mod tests {
             "sub/file.txt",
             "manifest names must use '/' on every platform"
         );
+    }
+
+    #[test]
+    fn directory_tree_preflight_rejects_nested_collisions_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault_dir = tmp.path().join("vault");
+        std::fs::create_dir_all(vault_dir.join("d")).unwrap();
+        let master = Key::generate();
+
+        let source = tmp.path().join("tree");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::write(source.join("sub").join("file.txt"), b"payload").unwrap();
+
+        // A stale nested entry that the new tree would overwrite.
+        let mut all = ManifestMap::new();
+        all.insert(
+            "tree/sub/file.txt".to_string(),
+            EntryMetadata {
+                id: "stale".into(),
+                original_name: "tree/sub/file.txt".into(),
+                original_size: 1,
+                is_directory: false,
+                children: None,
+                content_hash: None,
+            },
+        );
+
+        let err = add_directory_tree(
+            &vault_dir,
+            &master,
+            &source,
+            "tree",
+            &mut all,
+            crate::padding::Padding::None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::EntryExists(_)));
+
+        // No blobs were written and the index was not mutated.
+        assert!(std::fs::read_dir(vault_dir.join("d"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key("tree/sub/file.txt"));
     }
 
     #[test]

@@ -27,11 +27,16 @@ trailer; vault object locations are keyed by the master key.
 - Malware, keyloggers, or a compromised OS while a vault is unlocked.
 - An attacker who knows the password or has the unlocked process memory.
 - Coercion to reveal the password.
-- Traffic analysis of *sizes*: entry counts, directory shape, and approximate
-  file sizes leak unless padding is added. This is a documented limitation,
-  not a bug.
-- Rollback to an older valid snapshot of the vault directory. A generation
-  counter is on the roadmap.
+- Traffic analysis of *sizes*: entry counts, directory shape, and exact file
+  sizes leak unless opt-in size padding is enabled. Even with padding, access
+  patterns and timing remain observable.
+- Rollback to an older valid snapshot of the whole vault directory. The index
+  carries an internal generation and each entry records a plaintext content
+  hash, so a substituted blob for the same entry is detected; neither is a
+  hardware-backed anti-rollback counter.
+- Retroactive crypto-erasure. `Vault::erase` rotates the master key so the old
+  key stops working against the vault, but a copy of the deleted blob plus an
+  old key/config captured beforehand stays decryptable.
 - Secure erasure of deleted ciphertext on SSDs or journaling filesystems.
 
 The full threat model and design rationale are in
@@ -45,7 +50,9 @@ have their own reporting processes.
 
 ## Supported versions
 
-Keres is pre-1.0. Security fixes are applied to the latest 0.4.x release.
-Only the current Keres container format is supported. Every other format,
-including pre-rename Krypton containers and pre-0.4 formats, returns
-`Error::IncompatibleFormat`.
+Keres is pre-1.0. Security fixes are applied to the latest published release
+(currently the 0.6.x line). Only the current Keres container format is
+supported. Every other format, including pre-rename Krypton containers and
+pre-0.4 formats, returns `Error::IncompatibleFormat`. A 0.5.x vault
+(manifest v2) returns `Error::MigrationRequired` and is upgraded with
+`keres migrate`.

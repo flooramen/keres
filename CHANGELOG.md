@@ -43,12 +43,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (if-none-match), returning `WriteOutcome`. `Vault::apply_batch` commits
   several adds/replaces/removals in a single index commit. New
   `Error::Conflict` reports a failed precondition.
-- Crypto-erasure. `Vault::erase` removes an entry and then rotates the master
-  key (re-encrypting survivors) so captured copies of the deleted blob become
-  undecryptable; the vault ends up locked under the new password. Ordinary
-  `remove` documents that copies remain readable by holders of an old master
-  key. CLI `erase` command added. Metadata-leakage matrix published in
-  `docs/src/security.md`.
+- Forward key invalidation with `Vault::erase`. The entry is omitted from the
+  index and every survivor is re-encrypted under a fresh master key in one
+  journaled commit; the vault ends up locked under the new password. This is
+  not retroactive crypto-erasure: a copy of the deleted blob captured earlier
+  with the old key or config remains decryptable. Ordinary `remove` documents
+  the same limitation. CLI `erase` command added. Metadata-leakage matrix
+  published in `docs/src/security.md`.
+- Per-entry content hashes. The authenticated index records the plaintext
+  SHA-256 and size; `verify` and `extract` reject a substituted or stale blob
+  even when it authenticates under the same entry ID. Legacy entries without a
+  hash are size-checked only.
+
+### Fixed
+
+- `remove` commits the index before deleting blobs, so a failed deletion
+  leaves a pruneable orphan instead of an index that points at missing data.
+- `apply_batch` is all-or-nothing for the visible index: adds and replaces use
+  copy-on-write entry IDs, removals only drop index records, and old blobs are
+  deleted after the single commit. A failing operation leaves the prior index
+  and contents intact.
+- A missing `d/.manifest.enc` is now `InvalidVault` instead of an empty index.
+  `init` writes the first snapshot explicitly and refuses to clobber a
+  config-less vault that still has a recovery kit.
+- Root entry names are single components: `add`, `add_if`, batch adds, and
+  `rename` reject names containing `/`. Directory adds and directory renames
+  pre-flight every destination before writing anything.
+- `erase` no longer removes the entry under the old key before rotating.
+  Removal and rotation commit together, so a failed rotation leaves the old
+  vault and entry intact.
+- Rotation journals record old-key blob paths, so recovery can delete them
+  even though the old master is no longer available.
 
 ## [Unreleased] — 0.6.0
 

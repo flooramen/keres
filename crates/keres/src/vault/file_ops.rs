@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::container::{self, KeyDerivation, PayloadType};
 use crate::crypto::{self, Key};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::padding::Padding;
 use crate::vault::manifest::EntryMetadata;
 
@@ -43,6 +43,10 @@ pub(crate) fn blob_path(vault_dir: &Path, master: &Key, entry_id: &str) -> PathB
 /// `padding` is applied to file payloads only; directory placeholders are
 /// always unpadded. The exact source length is captured before reading so
 /// padded containers can zero-fill up to their bucket.
+///
+/// Returns `(blob_path, plaintext_sha256_hex, plaintext_size)`. Callers store
+/// the hash and size in the authenticated index so a later read can detect a
+/// substituted or rolled-back blob.
 pub(crate) fn write_entry(
     vault_dir: &Path,
     master: &Key,
@@ -50,7 +54,7 @@ pub(crate) fn write_entry(
     meta: &EntryMetadata,
     source: Option<&Path>,
     padding: Padding,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, String, u64)> {
     let mut src_file;
     let (src, source_len): (Option<&mut dyn Read>, Option<u64>) = match source {
         Some(p) => {
@@ -72,6 +76,9 @@ pub(crate) fn write_entry(
 ///
 /// When `padding` is not [`Padding::None`], `source_len` must be the exact
 /// number of plaintext bytes `source` will yield.
+///
+/// Returns `(blob_path, plaintext_sha256_hex, plaintext_size)`. The hash is
+/// computed from the real plaintext bytes (padding is excluded).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_entry_from_reader(
     vault_dir: &Path,
@@ -81,7 +88,7 @@ pub(crate) fn write_entry_from_reader(
     source: Option<&mut dyn Read>,
     padding: Padding,
     source_len: Option<u64>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, String, u64)> {
     // Directory placeholders have no plaintext to pad; a stray policy must
     // not turn a metadata-only entry into an error.
     let padding = if meta.is_directory {
@@ -106,24 +113,35 @@ pub(crate) fn write_entry_from_reader(
     };
 
     let tmp = crate::fsutil::sibling_temp_path(&target);
-    let outcome = (|| -> Result<()> {
+    let outcome = (|| -> Result<(String, u64)> {
+        let mut hasher = Sha256::new();
         let mut out_file = crate::fsutil::create_private_file(&tmp)?;
-        {
+        let written = {
             let mut w = BufWriter::new(&mut out_file);
-            container::write_container(
-                &mut w,
-                &kd,
-                None,
-                Some(master),
-                typ,
-                entry_id.as_bytes(),
-                source,
-                None,
-                padding,
-                source_len,
-            )?;
+            let written = {
+                // Hash only the real plaintext bytes; padding is written by the
+                // container layer after the source reaches EOF.
+                let mut hashed = source.map(|s| HashingReader {
+                    inner: s,
+                    hasher: &mut hasher,
+                });
+                container::write_container(
+                    &mut w,
+                    &kd,
+                    None,
+                    Some(master),
+                    typ,
+                    entry_id.as_bytes(),
+                    hashed.as_mut().map(|h| h as &mut dyn Read),
+                    None,
+                    padding,
+                    source_len,
+                )?
+                .0
+            };
             w.flush()?;
-        }
+            written
+        };
         out_file.sync_all()?;
         drop(out_file);
 
@@ -131,15 +149,29 @@ pub(crate) fn write_entry_from_reader(
         if let Some(parent) = target.parent() {
             crate::fsutil::sync_dir(parent);
         }
-        Ok(())
+        Ok((format!("{:x}", hasher.finalize()), written))
     })();
 
     match outcome {
-        Ok(()) => Ok(target),
+        Ok((hash, size)) => Ok((target, hash, size)),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
+    }
+}
+
+/// Hashes plaintext as the container reader pulls it from the source.
+struct HashingReader<'a> {
+    inner: &'a mut dyn Read,
+    hasher: &'a mut Sha256,
+}
+
+impl Read for HashingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 }
 
@@ -176,7 +208,41 @@ pub(crate) fn read_entry(
         original_size: trailer.size,
         is_directory: trailer.typ == PayloadType::Directory,
         children: None,
+        content_hash: None,
     })
+}
+
+/// Reads an entry and checks it against the authenticated index metadata.
+///
+/// Beyond AEAD authentication, this rejects a blob whose plaintext size or
+/// content hash differs from what the index recorded. That catches a storage
+/// attacker swapping in an older valid blob for the same entry ID, and stale
+/// size metadata from an interrupted write. Entries written before content
+/// hashes existed are only size-checked.
+///
+/// Returns the authenticated plaintext size.
+pub(crate) fn read_entry_checked(
+    vault_dir: &Path,
+    master: &Key,
+    meta: &EntryMetadata,
+    mut sink: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<u64> {
+    let mut hasher = Sha256::new();
+    let read = read_entry(vault_dir, master, &meta.id, meta.is_directory, |chunk| {
+        hasher.update(chunk);
+        sink(chunk)
+    })?;
+
+    if read.original_size != meta.original_size {
+        return Err(Error::Authentication);
+    }
+    if let Some(expected) = &meta.content_hash {
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != *expected {
+            return Err(Error::Authentication);
+        }
+    }
+    Ok(read.original_size)
 }
 
 /// Removes the blob backing an entry, if present. Best-effort removal of
@@ -204,5 +270,50 @@ mod tests {
         assert_eq!(a1, a2);
         assert_ne!(a1, b);
         assert!(a1.starts_with("/v/d/"));
+    }
+
+    #[test]
+    fn checked_read_rejects_size_and_hash_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path();
+        std::fs::create_dir_all(vault.join("d")).unwrap();
+        let master = Key::generate();
+        let src = tmp.path().join("src.txt");
+        std::fs::write(&src, b"hello world").unwrap();
+
+        let mut meta = EntryMetadata {
+            id: "entry".into(),
+            original_name: "src.txt".into(),
+            original_size: 0,
+            is_directory: false,
+            children: None,
+            content_hash: None,
+        };
+        let (_, hash, size) =
+            write_entry(vault, &master, "entry", &meta, Some(&src), Padding::None).unwrap();
+        meta.original_size = size;
+        meta.content_hash = Some(hash);
+
+        let mut out = Vec::new();
+        read_entry_checked(vault, &master, &meta, |chunk| {
+            out.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(out, b"hello world");
+
+        let mut wrong_size = meta.clone();
+        wrong_size.original_size += 1;
+        assert!(matches!(
+            read_entry_checked(vault, &master, &wrong_size, |_| Ok(())),
+            Err(Error::Authentication)
+        ));
+
+        let mut wrong_hash = meta;
+        wrong_hash.content_hash = Some("00".repeat(32));
+        assert!(matches!(
+            read_entry_checked(vault, &master, &wrong_hash, |_| Ok(())),
+            Err(Error::Authentication)
+        ));
     }
 }
