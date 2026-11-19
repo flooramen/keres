@@ -114,22 +114,35 @@ pub(crate) fn restrict_perms(path: &Path) {
 /// Newly created directories get mode `0700` at creation time, so there is no
 /// window where a vault directory is traversable by other users.
 pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            // Refuse to follow a planted symlink or to treat a non-directory
+            // as a directory: extraction must stay inside the destination tree.
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(Error::Operation(format!(
+                    "not a real directory: {}",
+                    path.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(path)?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(path)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)?;
-    }
-    Ok(())
 }
 
 /// Removes a file if it exists; missing files are not an error here.
