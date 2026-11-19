@@ -51,7 +51,7 @@ have their own reporting processes.
 ## Supported versions
 
 Keres is pre-1.0. Security fixes are applied to the latest published release
-(currently the 0.6.x line). Only the current Keres container format is
+(currently the 0.7.x line). Only the current Keres container format is
 supported. Every other format, including pre-rename Krypton containers and
 pre-0.4 formats, returns `Error::IncompatibleFormat`. A 0.5.x vault
 (manifest v2) returns `Error::MigrationRequired` and is upgraded with

@@ -38,7 +38,7 @@ Run `keres help` for the full command list.
 
 ```toml
 [dependencies]
-keres = "0.6"
+keres = "0.7"
 ```
 
 ```rust

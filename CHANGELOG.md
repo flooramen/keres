@@ -4,7 +4,7 @@ All notable changes to this workspace are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.7.0
+## [0.7.0] - 2026-11-19
 
 ### Added
 
@@ -78,7 +78,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Rotation journals record old-key blob paths, so recovery can delete them
   even though the old master is no longer available.
 
-## [Unreleased] — 0.6.0
+## [0.6.0] - 2026-11-19 (never published; folded into 0.7.0)
 
 ### Added
 
@@ -237,7 +237,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Pre-0.4 formats are retired; old files are rejected.
 
-[Unreleased]: https://github.com/Keres-rs/keres/compare/v0.5.0...HEAD
+[0.7.0]: https://github.com/Keres-rs/keres/compare/v0.5.0...v0.7.0
 [0.5.0]: https://github.com/Keres-rs/keres/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Keres-rs/keres/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Keres-rs/keres/compare/v0.4.0...v0.4.1
