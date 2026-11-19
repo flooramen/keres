@@ -22,6 +22,13 @@ fn init_twice_fails() {
 }
 
 #[test]
+fn init_refuses_to_clobber_a_config_less_vault_with_an_index() {
+    let (_d, mut v) = make_vault("initindex");
+    std::fs::remove_file(v.path().join("vault.config")).unwrap();
+    assert!(matches!(v.init("x"), Err(Error::VaultExists)));
+}
+
+#[test]
 fn locked_vault_rejects_operations() {
     let (_d, mut v) = make_vault("locked");
     v.lock();

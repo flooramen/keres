@@ -72,6 +72,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `erase` no longer removes the entry under the old key before rotating.
   Removal and rotation commit together, so a failed rotation leaves the old
   vault and entry intact.
+- `Vault::init` refuses to overwrite a vault directory whose index already
+  exists, and reports a clear error when a recovery kit cannot be deleted
+  after a successful recovery.
 - Rotation journals record old-key blob paths, so recovery can delete them
   even though the old master is no longer available.
 

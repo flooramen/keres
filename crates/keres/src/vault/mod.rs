@@ -261,6 +261,12 @@ impl Vault {
         if self.path.join("vault.recovery").is_file() {
             return Err(Error::VaultExists);
         }
+        // A config-less vault whose index still exists is not safe to
+        // overwrite: `init` would destroy the (possibly still recoverable)
+        // data, and the caller should recover or remove it explicitly.
+        if self.path.join("d").join(".manifest.enc").is_file() {
+            return Err(Error::VaultExists);
+        }
 
         let config = self.keystore.init(password)?;
         // Write the index before the config. A crash in between leaves no
@@ -975,7 +981,17 @@ impl Vault {
 
         let config = VaultConfig::new(&master, new_password)?;
         self.write_config(&config)?;
-        recovery::remove(&self.path)?;
+        // The vault is recovered even if the kit cannot be deleted; keep it
+        // usable and report the cleanup failure so the caller knows the code
+        // is still valid.
+        if let Err(e) = recovery::remove(&self.path) {
+            self.keystore.lock();
+            return Err(Error::Operation(format!(
+                "vault recovered, but the recovery kit could not be deleted; \
+                 remove {} manually: {e}",
+                self.path.join("vault.recovery").display()
+            )));
+        }
         self.keystore.lock();
         Ok(())
     }
