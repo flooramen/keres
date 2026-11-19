@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use fs4::FileExt;
-use keres::{Error, Vault};
+use keres::{BatchOp, Error, Padding, Vault, WriteOutcome};
 use tempfile::TempDir;
 
 fn make_vault(tag: &str) -> (TempDir, Vault) {
@@ -566,6 +566,124 @@ fn mutations_are_journaled_in_the_index_log() {
     again.unlock("master-password").unwrap();
     let names: Vec<_> = again.list().unwrap().into_iter().map(|e| e.name).collect();
     assert_eq!(names, vec!["b.txt"]);
+}
+
+#[test]
+fn conditional_write_conflicts_on_stale_version() {
+    let (dir, mut v) = make_vault("cond");
+    let src = dir.path().join("a.txt");
+    std::fs::write(&src, b"alpha").unwrap();
+    v.add(&src, None).unwrap();
+
+    let version = v.version().unwrap();
+    // A second, intervening mutation advances the version.
+    let src2 = dir.path().join("b.txt");
+    std::fs::write(&src2, b"beta").unwrap();
+    v.add(&src2, None).unwrap();
+
+    // Stale version -> conflict, nothing written.
+    let src3 = dir.path().join("c.txt");
+    std::fs::write(&src3, b"gamma").unwrap();
+    let outcome = v.add_if(&src3, None, Some(version)).unwrap();
+    assert!(matches!(outcome, WriteOutcome::Conflict { .. }));
+
+    // Fresh version -> applied.
+    let current = v.version().unwrap();
+    let outcome = v.add_if(&src3, None, Some(current)).unwrap();
+    assert!(matches!(outcome, WriteOutcome::Applied { .. }));
+    assert!(v.list().unwrap().iter().any(|e| e.name == "c.txt"));
+
+    // if-none-match: adding an existing name conflicts.
+    let outcome = v.add_if(&src3, Some("c.txt"), None).unwrap();
+    assert!(matches!(outcome, WriteOutcome::Conflict { .. }));
+}
+
+#[test]
+fn replace_if_requires_entry() {
+    let (dir, mut v) = make_vault("replaceif");
+    let src = dir.path().join("a.txt");
+    std::fs::write(&src, b"alpha").unwrap();
+    v.add(&src, None).unwrap();
+
+    let version = v.version().unwrap();
+    let src2 = dir.path().join("a2.txt");
+    std::fs::write(&src2, b"alpha2").unwrap();
+    let outcome = v.replace_if(&src2, "a.txt", Some(version)).unwrap();
+    assert!(matches!(outcome, WriteOutcome::Applied { .. }));
+
+    // Missing entry -> conflict.
+    let outcome = v.replace_if(&src2, "nope.txt", None).unwrap();
+    assert!(matches!(outcome, WriteOutcome::Conflict { .. }));
+}
+
+#[test]
+fn apply_batch_commits_once() {
+    let (dir, mut v) = make_vault("batch");
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, b"alpha").unwrap();
+    std::fs::write(&b, b"beta").unwrap();
+
+    v.apply_batch(&[
+        BatchOp::Add {
+            source: a.clone(),
+            name: None,
+        },
+        BatchOp::Add {
+            source: b.clone(),
+            name: Some("renamed.txt".into()),
+        },
+    ])
+    .unwrap();
+
+    let names: Vec<_> = v.list().unwrap().into_iter().map(|e| e.name).collect();
+    assert!(names.contains(&"a.txt".to_string()));
+    assert!(names.contains(&"renamed.txt".to_string()));
+}
+
+#[test]
+fn erase_removes_and_rotates() {
+    let (dir, mut v) = make_vault("erase");
+    let src = dir.path().join("secret.txt");
+    std::fs::write(&src, b"secret").unwrap();
+    v.add(&src, None).unwrap();
+    let src2 = dir.path().join("keep.txt");
+    std::fs::write(&src2, b"keep").unwrap();
+    v.add(&src2, None).unwrap();
+
+    v.erase("secret.txt", "new-password").unwrap();
+    assert!(!v.is_unlocked());
+
+    let mut v2 = Vault::new(v.path().to_path_buf());
+    v2.unlock("new-password").unwrap();
+    let names: Vec<_> = v2.list().unwrap().into_iter().map(|e| e.name).collect();
+    assert_eq!(names, vec!["keep.txt"]);
+    // Old password no longer works.
+    assert!(Vault::new(v.path().to_path_buf())
+        .unlock("master-password")
+        .is_err());
+}
+
+#[test]
+fn padding_round_trips_through_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut v = Vault::new(dir.path().join("vault"));
+    v.init_with_padding("master-password", Padding::Adaptive)
+        .unwrap();
+    assert_eq!(v.padding().unwrap(), Padding::Adaptive);
+
+    let src = dir.path().join("f.txt");
+    let data = vec![0xABu8; 1000];
+    std::fs::write(&src, &data).unwrap();
+    v.add(&src, None).unwrap();
+
+    let out = dir.path().join("out.txt");
+    v.extract("f.txt", &out).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+
+    // Changing policy persists.
+    v.set_padding(Padding::fixed(8192).unwrap()).unwrap();
+    assert_eq!(v.padding().unwrap(), Padding::fixed(8192).unwrap());
 }
 
 #[test]

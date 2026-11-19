@@ -41,12 +41,16 @@ matters most for the monorepo.
       crash recovery, and automatic journal recovery on lock acquisition.
 - [x] Internal index generations: authenticated in the snapshot, matched by
       the log, advanced by compaction, with crash-phase recovery tests.
+- [x] Opt-in L2 size padding: adaptive/fixed buckets, padded v2 containers,
+      vault policy in the authenticated index, CLI `--padding`/`padding`.
 - [x] Conditional writes (`if-match`/`if-none-match`): `Vault::version`,
       `add_if`, `replace_if`, `WriteOutcome`, `Error::Conflict`.
 - [x] Explicit batch commit: `Vault::apply_batch` + `BatchOp`.
 - [x] Crypto-erasure: `Vault::erase` + CLI `erase` (rotates master key).
-- [ ] Group commit timing coarsening (jittered flush) — deferred.
-- [ ] Parallel chunk pipeline.
+- [x] Metadata-leakage matrix published in `docs/src/security.md`.
+- [ ] Group commit timing coarsening (jittered flush) — deferred to 1.0.
+- [ ] Operation-count bucketing (coarse count hiding) — deferred.
+- [ ] Parallel chunk pipeline — deferred.
 
 ## Later
 
