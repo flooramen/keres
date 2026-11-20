@@ -21,6 +21,12 @@ pub enum Error {
     #[error("unsupported container version: {0}")]
     UnsupportedVersion(u32),
 
+    /// The vault was written by an older format that this build can upgrade
+    /// but will not read in place. Run `keres migrate <vault>` (or
+    /// [`crate::Vault::migrate`]) before using it.
+    #[error("vault uses a legacy format; run `keres migrate` to upgrade it")]
+    MigrationRequired,
+
     /// The file is not a current Keres container. This covers every other
     /// format, including pre-rename Krypton releases and pre-0.4 formats.
     /// Extract the data with the release that wrote it.
@@ -81,6 +87,11 @@ pub enum Error {
     #[error("entry already exists: {0}")]
     EntryExists(String),
 
+    /// A conditional write's precondition did not hold (if-match/if-none-match
+    /// failed). The vault was not modified.
+    #[error("precondition failed: vault state changed")]
+    Conflict,
+
     /// Serialization/deserialization of an encrypted structure failed after
     /// successful decryption.
     #[error("malformed decrypted payload")]
@@ -90,6 +101,11 @@ pub enum Error {
     /// confirmation mismatch).
     #[error("{0}")]
     Operation(String),
+
+    /// A streaming operation was cancelled through
+    /// [`crate::streaming::StreamOptions`].
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 impl Error {

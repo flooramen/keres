@@ -21,21 +21,40 @@ matters most for the monorepo.
 
 ## Next
 
-- [ ] `keres migrate`: re-encrypt 0.5.0 (manifest v2) vaults into v3 before
-      the 0.6.0 tag.
+- [x] `keres migrate`: re-encrypt 0.5.0 (manifest v2) vaults into v3 in place
+      (stable IDs, atomic manifest cut-over, legacy blobs removed).
 - [x] Decouple entry identity from the mutable path (stable random IDs), so
       `rename` does not require re-encryption.
-- [ ] Public streaming API (`Read`/`Write` adapters), progress, and
-      cancellation.
+- [x] Public streaming API (`Read`/`Write` adapters), progress, and
+      cancellation (`keres::streaming`, `EncryptWriter`/`DecryptReader`).
 - [ ] Entry metadata (mtime, mode) and `list --recursive` / `stat`.
-- [ ] Multi-recipient keys (X25519), LUKS-style key slots, and a printable
-      recovery kit.
+- [x] Printable recovery kit (`keres recovery create` / `recovery use`,
+      `Vault::create_recovery_kit` / `Vault::recover`).
+- [x] LUKS-style keyslots (`Vault::add_keyslot` / `remove_keyslot`,
+      `keres keyslot add|remove|list`; config v3 slot table).
+- [x] Opt-in deep rotation (`Vault::rotate` / `keres rotate`): fresh master
+      key, every entry re-encrypted, journal-based crash recovery; collapses
+      to one keyslot and removes the recovery kit.
+- [ ] Multi-recipient keys (X25519).
 - [x] Orphan garbage collection (`verify --prune`).
-- [ ] Parallel chunk pipeline.
+- [x] Append-only encrypted index log with snapshot compaction, journaled
+      crash recovery, and automatic journal recovery on lock acquisition.
+- [x] Internal index generations: authenticated in the snapshot, matched by
+      the log, advanced by compaction, with crash-phase recovery tests.
+- [x] Opt-in L2 size padding: adaptive/fixed buckets, padded v2 containers,
+      vault policy in the authenticated index, CLI `--padding`/`padding`.
+- [x] Conditional writes (`if-match`/`if-none-match`): `Vault::version`,
+      `add_if`, `replace_if`, `WriteOutcome`, `Error::Conflict`.
+- [x] Explicit batch commit: `Vault::apply_batch` + `BatchOp`.
+- [x] Crypto-erasure: `Vault::erase` + CLI `erase` (rotates master key).
+- [x] Metadata-leakage matrix published in `docs/src/security.md`.
+- [ ] Group commit timing coarsening (jittered flush) — deferred to 1.0.
+- [ ] Operation-count bucketing (coarse count hiding) — deferred.
+- [ ] Parallel chunk pipeline — deferred.
 
 ## Later
 
-- [ ] Optional size-hiding padding buckets.
+- [x] Optional size-hiding padding buckets (opt-in, adaptive/fixed).
 - [ ] Snapshot/version history and restore.
 - [ ] Hardware-backed keys (TPM, Secure Enclave, FIDO2).
 - [ ] External security audit and a 1.0 release.

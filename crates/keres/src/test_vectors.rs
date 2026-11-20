@@ -11,6 +11,7 @@ use std::io::Cursor;
 use crate::container::{self, KeyDerivation, PayloadType};
 use crate::crypto::Key;
 use crate::kdf::KdfParams;
+use crate::padding::Padding;
 
 /// Fixed Argon2id salt for the standalone vector.
 pub const ARGON_SALT: [u8; 32] = [0x11; 32];
@@ -47,6 +48,8 @@ pub fn standalone(password: &str, plaintext: &[u8], original_name: &str) -> Vec<
         b"",
         Some(&mut src),
         Some(original_name),
+        Padding::None,
+        None,
     )
     .expect("deterministic vector construction cannot fail");
     out
@@ -72,6 +75,8 @@ pub fn hkdf_file(plaintext: &[u8], identity: &str) -> Vec<u8> {
         identity.as_bytes(),
         Some(&mut src),
         None,
+        Padding::None,
+        None,
     )
     .expect("deterministic vector construction cannot fail");
     out
@@ -95,6 +100,8 @@ pub fn manifest(json: &[u8]) -> Vec<u8> {
         PayloadType::Manifest,
         b"vault-manifest",
         Some(&mut src),
+        None,
+        Padding::None,
         None,
     )
     .expect("deterministic vector construction cannot fail");

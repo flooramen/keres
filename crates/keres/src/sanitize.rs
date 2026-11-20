@@ -11,10 +11,12 @@ use crate::error::{Error, Result};
 /// Maximum accepted entry-name length in bytes.
 pub const MAX_NAME_LEN: usize = 255;
 
-/// Validates a name supplied for a *new* vault entry.
+/// Validates a vault-relative name that may contain `/`-separated components.
 ///
-/// Rules: non-empty, at most [`MAX_NAME_LEN`] bytes, no NUL, no `/` or `\`
-/// separators, no `.`/`..` components, not absolute.
+/// This is the validator for names already stored in the index and for
+/// tree-relative paths produced while adding a directory. Rules: non-empty,
+/// at most [`MAX_NAME_LEN`] bytes, no NUL, no `\`, no `.`/`..` components, not
+/// absolute. Use [`validate_root_name`] for a user-supplied *top-level* entry.
 pub fn validate_new_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > MAX_NAME_LEN {
         return Err(Error::invalid_name(name));
@@ -34,6 +36,20 @@ pub fn validate_new_name(name: &str) -> Result<()> {
     }
     // Backslash is a separator on Windows and confusing everywhere else.
     if name.contains('\\') {
+        return Err(Error::invalid_name(name));
+    }
+    Ok(())
+}
+
+/// Validates a user-supplied *root* entry name.
+///
+/// A root name is a single path component: [`validate_new_name`] plus a
+/// rejection of `/`. Allowing `a/b` here would create an entry whose parent
+/// directory does not exist, which `list` would hide and recursive removal
+/// would not reach.
+pub fn validate_root_name(name: &str) -> Result<()> {
+    validate_new_name(name)?;
+    if name.contains('/') {
         return Err(Error::invalid_name(name));
     }
     Ok(())
@@ -64,6 +80,14 @@ mod tests {
         assert!(validate_new_name("photos").is_ok());
         assert!(validate_new_name("photos/vacation/img.png").is_ok());
         assert!(validate_new_name("ünïcødé.txt").is_ok());
+        assert!(validate_root_name("report.pdf").is_ok());
+        assert!(validate_root_name("photos").is_ok());
+    }
+
+    #[test]
+    fn root_names_reject_path_separators() {
+        assert!(validate_root_name("photos/vacation/img.png").is_err());
+        assert!(validate_root_name("a/").is_err());
     }
 
     #[test]

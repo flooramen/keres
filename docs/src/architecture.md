@@ -72,7 +72,7 @@ offset  size                     field
 ────────────────────────────────────────────────────────────────
 0       8    "KERES\0\0\0"          magic (NUL is a control byte:
                                   cannot occur in plain text)
-8       2    u16 LE               envelope version (currently 1)
+8       2    u16 LE               envelope version (1, or 2 with size padding)
 10      1    kind                 0 = HKDF-from-master
                                   1 = password-derived
 11      32   (kind 0)             object_salt
@@ -99,7 +99,8 @@ Any file whose magic is not exactly `KERES\0\0\0` is rejected with
 Krypton formats, and unrelated files. Only the current Keres format is
 accepted; extract old data with the release that wrote it. A header with the
 right magic but a newer envelope version fails early with
-`UnsupportedVersion(v)`.
+`UnsupportedVersion(v)`. Vaults are the one exception: a readable 0.5.x vault
+manifest is reported as `MigrationRequired` and upgraded by `keres migrate`.
 
 ### Trailer
 
@@ -137,14 +138,15 @@ manifest and never changes, so the blob location and AAD are independent of
 the entry's mutable path. This closes the *blob-transplant* attack class
 entirely: an attacker who swaps two blobs in the vault directory gets
 `Corrupted` reports from `verify()` and errors on extract — never silently
-wrong content.
+wrong content. The authenticated index also records the plaintext SHA-256, so
+replaying an older valid blob under the same entry ID is rejected too.
 
 ### Payload types
 
-`PayloadType` has three variants today. Adding new object kinds (future
-metadata sidecars, keyslots, recovery kits) means adding a variant with a
-new AAD context string — **never** changing existing ones. This is the
-core reason the format can evolve without a format zoo.
+`PayloadType` has three variants today. Adding new container kinds (future
+metadata sidecars or keyslots) means adding a variant with a new AAD context
+string — **never** changing existing ones. This is the core reason the format
+can evolve without a format zoo.
 
 ---
 
@@ -224,6 +226,32 @@ it, and returns it. Plaintext is written via temp+rename as well.
 Memory use is bounded by one chunk buffer (+tag) regardless of file size;
 multi-gigabyte files stream at constant memory.
 
+### Streaming API
+
+`keres::streaming` exposes the same wire format to library code that does not
+have files:
+
+| Type / function | Direction |
+|---|---|
+| `EncryptWriter` | `Write`: plaintext in, ciphertext out; `finish()` writes the trailer |
+| `DecryptReader` | `Read`: ciphertext in, authenticated plaintext out; EOF verifies the trailer |
+| `encrypt_stream` / `decrypt_stream` | Convenience loops that keep the typed `Error` |
+
+`StreamOptions` adds a cumulative-byte progress callback and an
+`AtomicBool` cancellation flag polled once per chunk. Cancellation returns
+`Error::Cancelled`; through the `io` adapters it is wrapped in an
+`io::Error`, with the typed error recoverable from its source.
+
+Every chunk is authenticated before its plaintext is yielded, but the trailer
+holds the total size and chunk count, so a truncated or trailer-tampered
+stream can deliver authenticated plaintext before the final error. File
+writers should therefore stage output through temp+rename, exactly as
+`decrypt_file` does. This is an inherent property of streaming, not a laxity
+in the chunk authentication.
+
+The adapters and functions are format-compatible with `encrypt_file` and
+`decrypt_file` in both directions.
+
 ---
 
 ## Vault mode
@@ -233,36 +261,129 @@ A vault is a directory:
 ```
 myvault/
 ├── vault.config          bootstrap JSON (plaintext structure, sealed value)
+├── vault.recovery        optional second wrapping of the master key
+├── vault.rotate          transient deep-rotation journal (present only mid-run)
 ├── vault.lock            advisory inter-process lock (empty)
 └── d/
-    ├── .manifest.enc     the index, as a kind-0 container
+    ├── .manifest.enc     compacted index snapshot, as a kind-0 container
+    ├── .index.log        encrypted append-only mutations after the snapshot
+    ├── .index.compact    transient index-compaction journal
+    ├── .manifest.enc.next  staged manifest during rotation (transient)
+    ├── .index.log.next     staged empty log during compaction (transient)
+    ├── .index.snapshot.next  staged snapshot during compaction (transient)
     └── <h2>/<h48>.enc    one blob per entry, as kind-0 containers
 ```
 
 Every mutating operation takes an exclusive advisory lock on `vault.lock`;
 read operations (`list`, `extract`, `verify`) take a shared lock. Locks are
 non-blocking: a second process gets `Error::VaultBusy` instead of waiting and
-risking a stale manifest. The lock is released when the operation returns.
+risking a stale index. The lock is released when the operation returns.
 `flock(2)` is used on Unix and `LockFileEx` on Windows via `fs4`.
+
+If a rotation or an index compaction committed but did not finish (the
+process died between its journal write and cleanup), the next operation that
+takes the lock recovers it first. A reader that only needs a shared lock
+silently upgrades to the exclusive lock for that recovery step.
 
 ### vault.config (bootstrap)
 
 A small JSON document — *not* a container, because it must be parseable
-before any key exists:
+before any key exists. Version 3 holds a table of independent keyslots, each
+wrapping the *same* master key under its own password-derived KEK:
 
 ```json
 {
-  "version": 2,
-  "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
-  "salt": "<base64, ≥8 bytes>",
-  "wrapped_master_key": "<base64, master ‖ GCM tag>"
+  "version": 3,
+  "slots": [
+    {
+      "id": "0123456789abcdef",
+      "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
+      "salt": [..32 bytes..],
+      "nonce": [..12 bytes..],
+      "wrapped_master_key": [..master ‖ GCM tag..]
+    }
+  ]
 }
 ```
 
-The master key is generated once at `init`, encrypted under the KEK with
-AAD `"keres-vault-config-v2"` and the fixed config nonce (safe: unique
-KEK, single short message). Wrong password and tampered config are
-indistinguishable (`Authentication`) by design.
+The master key is generated once at `init`. Each slot has a fresh random
+salt, a random 96-bit nonce, and AAD `"keres-vault-config-v3/" + slot_id`, so
+wrapped keys cannot be transplanted between slots undetected. Unlocking tries
+each slot; `change_password` re-wraps only the slot that matched;
+`add_keyslot` appends a slot; `remove_keyslot` deletes one and must be
+authorized by a passphrase from a slot that remains. Slot ids are plaintext,
+like the rest of the bootstrap structure. Wrong password and tampered
+config are indistinguishable (`Authentication`) by design; a structurally
+malformed slot is `InvalidVault`.
+
+Version 2 configs (the 0.5.x single implicit slot, fixed nonce, AAD
+`"keres-vault-config-v2"`) are still read and are rewritten as version 3 the
+next time a key operation changes the config. No password changes during that
+upgrade.
+
+### vault.recovery (recovery kit)
+
+Optional. Created by `keres recovery create` / `Vault::create_recovery_kit`:
+a second, independent wrapping of the same master key.
+
+```json
+{
+  "version": 1,
+  "kdf": {"m_cost_kib": 65536, "t_cost": 4, "p_cost": 4},
+  "salt": [..32 bytes..],
+  "nonce": [..12 bytes..],
+  "wrapped_master_key": [..master ‖ GCM tag..]
+}
+```
+
+The KEK is Argon2id over a random 160-bit code, printed once as nine groups
+of four Crockford Base32 symbols with a 16-bit checksum. The code is never
+stored. The file is not a container because it must be parsed before any key
+exists; AEAD with a random nonce and AAD `"keres-vault-recovery-v1"`
+authenticates it. `Vault::recover` validates the unwrapped master against the
+encrypted index, re-wraps `vault.config` as a fresh single-slot config, and
+consumes the kit. Losing `vault.config` no longer bricks the vault; losing
+the code still does. Any extra keyslots are lost in recovery and must be
+re-added.
+
+### vault.rotate (rotation journal)
+
+`Vault::rotate` / `keres rotate` performs an opt-in **deep rotation**: it
+generates a fresh master key, streams every blob through re-encryption, and
+rewrites the index under the new key. The new config has exactly one keyslot
+under the new password; other keyslots and the recovery kit wrapped the old
+master key and are discarded.
+
+Rotation writes `d/.manifest.enc.next`, then a small `vault.rotate` journal
+containing the new config (already wrapped) and the SHA-256 of the staged
+manifest — never a plaintext key:
+
+```json
+{"version": 1, "manifest_sha256": "..64 hex..",
+ "config": "{..v3 config..}", "old_blobs": ["d/ab/cd....enc", "..."]}
+```
+
+The journal write is the commit point. After it, the staged manifest is
+renamed over `.manifest.enc`, the config is replaced, the old recovery kit is
+removed, and the journal is deleted. If the process dies after the journal
+but before completion, the next operation that opens the vault finishes the
+swap: it compares the journal hash against the canonical and staged
+manifests, promotes the staged one when it matches, and installs the config.
+If neither manifest matches, the rotation is rolled back and the journal is
+discarded. Before the journal exists, the old vault is untouched and the
+staged blobs are ordinary orphans for `prune_orphans`.
+
+`old_blobs` lists the old-key ciphertext paths so recovery can delete them
+even though the old master is no longer available. Only paths under `d/`
+ending in `.enc` (other than `.manifest.enc`) are accepted. Rotation removes
+them best-effort after the swap, and any leftovers are reclaimed by
+`verify --prune`.
+
+`Vault::erase` reuses this machinery: the entry to erase is added to the
+rotation's removed set, so omission and re-encryption commit together. If
+rotation fails, the old vault (including the entry) is left intact. Erasure
+invalidates the old master key going forward; it is not retroactive
+crypto-erasure of a blob an attacker already copied.
 
 ### Blob locations
 
@@ -274,49 +395,110 @@ blob_path(entry_id) = d / sha256(master_key ‖ entry_id)[..2] /
 Paths are deterministic (stable across restarts and renames), keyed by the
 master key (so unrelated vaults never share blob names), and leak nothing but
 entry count and rough sizes via the tree shape. Because the hash input is the
-entry's stable ID rather than its path, renaming an entry only rewrites the
-encrypted manifest; no ciphertext is re-encrypted.
+entry's stable ID rather than its path, renaming an entry only updates the
+encrypted index; no ciphertext is re-encrypted.
 
-### Manifest
+### Index: snapshot + append-only log
 
-The index is a `BTreeMap<String, EntryMetadata>` serialized to JSON
-`{"version":3,"files":{...}}`, then stored as a kind-0 container with payload
-type `Manifest`. Each `EntryMetadata` records a non-empty 128-bit hex `id`,
-the original name, size, directory flag, and child lists for directories.
-Version 2 manifests are rejected (`UnsupportedVersion`), and a version 3
-manifest with an empty ID is rejected as `InvalidVault`; IDs are the root of
-blob identity, so a missing one cannot be repaired safely.
+The logical index is a `BTreeMap<String, EntryMetadata>` serialized to JSON.
+Each `EntryMetadata` records a non-empty 128-bit hex `id`, the original name,
+size, directory flag, child lists for directories, and an optional SHA-256 of
+the plaintext (`content_hash`). The hash binds a blob to the exact contents
+the index recorded; it is `None` for entries written by releases before the
+field existed, which are size-checked only.
 
-Load semantics (hardened after audit finding #1):
+The index is stored in two parts:
+
+- `d/.manifest.enc` — a compacted snapshot, written as a kind-0 container with
+  payload type `Manifest`.
+- `d/.index.log` — encrypted, authenticated mutation batches appended after
+  that snapshot.
+
+Saving an operation does **not** rewrite the whole snapshot. The library loads
+the current logical index (snapshot plus replayed log), computes the set of
+`put`/`delete` records that turn it into the new map, and appends them as one
+batch. Reading decodes the snapshot once and replays each batch in order.
+
+```
+log header:  b"KERESIDX" | version u16 | generation u64 |
+             snapshot_sha256[32] | log_id[32]
+log record:  len u32 | index u64 | nonce[12] | ciphertext || GCM tag
+```
+
+Each log gets a random `log_id`; its record key is
+`HKDF(master, log_id, "keres-vault-index-log-v1")`. Record AAD binds the full
+header bytes and the record index, so records cannot be moved between logs,
+reordered, or replayed under another generation. The header's snapshot hash
+ties the log to exactly one snapshot: mixing a log with a different snapshot
+is `InvalidVault`, and a log whose key does not authenticate is
+`Authentication`.
+
+The snapshot's authenticated JSON also carries a monotonic `generation`
+(pre-generation v3 snapshots read as `0`). A log must declare the same
+generation as the snapshot it extends; a mismatch is `InvalidVault`.
+Compaction writes `generation + 1` into the new snapshot and its empty log.
+Generations are internal: they make replace/compaction swaps unambiguous and
+support consistent read snapshots, but without hardware-backed state they are
+not a rollback detector.
+
+A log is written with one `write_all` plus `sync_data` per batch. A crash may
+leave a torn final record; replay stops at the last valid record and the next
+append truncates the tail. Damage in the middle of the log is an error, never
+a silent truncation.
+
+When the log reaches 512 records or 8 MiB, the next save compacts it: a fresh
+snapshot is written, a new empty log is created that names it by SHA-256, and
+the old log is removed. Compaction is journaled in `d/.index.compact`; an
+interrupted compaction is finished on the next lock acquisition. Deep rotation
+and migration install a new snapshot and remove any log encrypted under the
+old index key.
+
+Version 2 manifests are rejected by the reader with `MigrationRequired`
+(and an empty ID in a version 3 manifest is rejected as `InvalidVault`; IDs
+are the root of blob identity, so a missing one cannot be repaired safely).
+`Vault::migrate` / `keres migrate` upgrades a v2 vault in place: it
+re-encrypts every entry under a fresh ID, then commits the v3 snapshot
+atomically. A failure before that commit leaves the legacy manifest intact.
+
+Load semantics:
 
 | State | Result |
 |---|---|
-| File absent | empty index (fresh/uninitialized data dir) |
-| Present but damaged/truncated/unauthentic | **error** — never silently empty |
-| Larger than 64 MiB read cap | rejected before allocation |
-
-A fresh random `object_salt` is generated on every save; the manifest is
-rewritten wholesale (temp+rename), never mutated in place.
+| Snapshot absent | **error** — only `init` creates the first snapshot; treating it as empty would drop every record on the next save |
+| Snapshot present but damaged/truncated/unauthentic | **error** — never silently empty |
+| Log present but snapshot absent, or bound to another snapshot/generation | **error** |
+| Snapshot larger than the 64 MiB read cap | rejected before allocation |
 
 ### Operations
 
 | API | Behavior notes |
 |---|---|
-| `init(pw)` | creates dir mode 0700, config, empty manifest |
+| `init(pw)` | creates dir mode 0700 and the empty index snapshot, then writes the config; refuses to clobber a config-less vault that still has a recovery kit |
 | `unlock` / `lock` | unwraps master into memory / drops it |
-| `add(src, name)` | validates target name, rejects collisions & separators; directories recurse, creating placeholder entries; every blob temp+rename |
-| `replace(src, name)` | rewrites one existing file blob and updates its manifest record; directory entries are rejected |
-| `rename(from, to)` | top-level only; rewrites the manifest keys and child lists (for directories, the whole subtree) without touching ciphertext |
-| `list()` | reads manifest only — no blobs touched, fast |
-| `extract(name, dest)` | recreates hierarchy; names sanitized; outputs via temp+rename |
-| `remove(name)` | removes subtree: blobs *and* manifest records (no orphans from successful ops) |
-| `change_password(old,new)` | verifies old, re-wraps same master; ciphertext untouched |
-| `verify(pw)` | decrypts every blob (type-checked), cross-checks manifest presence; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
-| `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no manifest record references; refuses if the manifest is missing |
+| `add(src, name)` | validates a single-component root name (no separators), rejects collisions; directories pre-flight every destination before writing; every blob temp+rename; index batch appended last |
+| `replace(src, name)` | writes a fresh blob under a new entry ID (copy-on-write), appends the index record, then deletes the old blob; directory entries are rejected |
+| `rename(from, to)` | top-level only; pre-checks every destination in a moved subtree; appends `put` records for the new keys and child lists without touching ciphertext |
+| `add_if` / `replace_if` | conditional variants; return `WriteOutcome` and `Error::Conflict` without modifying the vault when the precondition fails |
+| `apply_batch(ops)` | adds/replaces write fresh IDs, removes only drop index records, then one index commit; old blobs are deleted after the commit |
+| `list()` | reads snapshot + log only — no blobs touched, fast |
+| `extract(name, dest)` | recreates hierarchy; names sanitized; verifies size and content hash; outputs via temp+rename |
+| `remove(name)` | drops subtree index records and commits, then deletes blobs best-effort (a failed deletion leaves a pruneable orphan, never a dangling index) |
+| `erase(name,new_pw)` | omits the subtree and performs a deep rotation in one journaled commit; on failure the old vault and entry remain |
+| `change_password(old,new)` | verifies old, re-wraps only that keyslot; ciphertext and other slots untouched |
+| `rotate(old,new)` | deep rotation: fresh master key, all blobs re-encrypted, snapshot rewritten and the old log removed; collapses to one keyslot, removes the recovery kit, leaves the vault locked; crash-safe via `vault.rotate` |
+| `keyslots()` | lists plaintext slot ids; no password required |
+| `add_keyslot(existing,new)` | verifies an existing passphrase and appends an independent slot; upgrades a legacy config |
+| `remove_keyslot(id,pw)` | revokes a slot, authorized by a passphrase from a slot that remains; the last slot is refused |
+| `verify(pw)` | decrypts every blob (type-checked), checks size and content hash against the replayed index; returns `IntegrityReport{total, verified, missing[], corrupted[]}` |
+| `prune_orphans()` | deletes `.enc` blobs and stale `.tmp-*` files under `d/` that no replayed index record references; refuses if the snapshot is missing |
+| `migrate(pw)` | one-way v2 → v3 upgrade: re-encrypts every entry under a fresh ID, swaps the snapshot atomically, then removes legacy blobs; returns `MigrationReport{entries, bytes}` |
+| `create_recovery_kit(pw)` | verifies the password, writes `vault.recovery`, returns a one-time printable `RecoveryCode` |
+| `recover(code,new_pw)` | unwraps the master with the code, validates it against the index, re-wraps the config, consumes the kit |
 
-Directory removal walks the manifest's own child lists, so removing a
-directory removes everything beneath it even if nested names were added
-out of order.
+Directory removal walks the manifest's own child lists (and the `/`-prefixed
+range, so a stale child list cannot strand descendants), so removing a
+directory removes everything beneath it even if nested names were added out of
+order.
 
 ### Path-traversal defense
 
@@ -335,11 +517,31 @@ Invariants: a crash may lose the *current* operation, never corrupt
 - All persistent writes go through: create temp file in same directory →
   restrict to owner-only → write → `sync_all()` → `rename()` over target →
   `sync_dir()` on the parent directory.
-- Containers are immutable once written; updates replace whole files.
-  There is no in-place mutation anywhere, which also eliminates torn-header
-  states.
-- Failure mid-add leaves unreferenced blobs (manifest unchanged) — visible
-  to nobody, and reclaimed by `verify --prune` / `Vault::prune_orphans`.
+- Containers and snapshots are immutable once written; updates replace whole
+  files via temp+rename. The index log is the one append-in-place file; it is
+  record-framed so a torn final write is detected and truncated. There are no
+  torn-header states.
+- Failure mid-add leaves unreferenced blobs (index batch not yet appended) —
+  visible to nobody, and reclaimed by `verify --prune` /
+  `Vault::prune_orphans`.
+- Replaces are copy-on-write: a fresh blob and entry ID are written, the index
+  is committed, and only then is the old blob deleted. A failed replace leaves
+  the previous version fully readable.
+- Removals commit the index first and delete blobs afterwards, so a deletion
+  failure can leave an orphan but never an index that points at missing data.
+- `apply_batch` writes all new blobs and computes the final index in memory
+  before its single commit. A failure at any point leaves the index unchanged;
+  fresh blobs become pruneable orphans.
+- Deep rotation commits through `vault.rotate` before touching the canonical
+  index, so an interrupted run is either rolled back or completed on the next
+  open. The journal lists old-key blobs so recovery can delete them too. A
+  staged `.manifest.enc.next` without a journal is ignored.
+- `erase` is a rotation with a removed set: the entry is omitted from the new
+  index and survivors are re-encrypted before the commit. A failure leaves the
+  old vault (including the entry) intact.
+- Index compaction commits through `d/.index.compact` before the snapshot/log
+  swap. An interrupted run promotes or discards the staged pair on the next
+  lock acquisition; staged files without a journal are deleted.
 
 ---
 
@@ -366,12 +568,16 @@ One enum (`Error`, thiserror), `Result<T> = std::result::Result<T, Error>`:
 | `Authentication` | wrong password/key **or** any tampering — indistinguishable on purpose |
 | `InvalidHeader` | malformed kind, lengths, or trailer |
 | `UnsupportedVersion(u32)` | envelope/schema/config version newer than supported |
+| `MigrationRequired` | legacy vault manifest; run `keres migrate` |
 | `IncompatibleFormat` | file is not a current Keres container |
 | `InvalidVault` | vault structure problems (bad config, damaged manifest) |
 | `VaultLocked` / `VaultUnlocked` | state-machine misuse |
 | `VaultBusy` | another process holds the vault lock |
+| `Cancelled` | a streaming operation was stopped by its cancellation flag |
 | `EntryExists` / `EntryNotFound` | name conflicts |
-| `InvalidName(String)` | validation failure (preview truncated to 32 chars) |
+| `Conflict` | a conditional write's precondition failed; the vault was not modified |
+| `InvalidEntryName(String)` | validation failure (preview truncated to 32 chars) |
+| `Operation(String)` | user-level operation could not be performed |
 | `Io(std::io::Error)` | filesystem layer |
 | `Encryption` / `KeyDerivation` / `InvalidKdfParams` / `MalformedPayload` | internal/crypto-layer failures |
 
@@ -380,3 +586,50 @@ Deliberate policy: callers cannot distinguish "wrong password" from
 messages into a tamper oracle.
 
 ---
+
+---
+
+## Size padding (opt-in, envelope v2)
+
+By default a container's ciphertext length tracks its plaintext length
+exactly. That leaks the file size to anyone who can measure the storage
+medium. Opt-in padding rounds the plaintext up to a bucket before
+encryption, so an observer learns only the bucket.
+
+Padding is selected per container:
+
+- `.krs`: `Padding` passed to `encrypt_file_with_padding` (CLI: `--padding`).
+- Vault: `Padding` stored in the authenticated index snapshot
+  (`ManifestFile.padding`, default `None`), so a storage attacker cannot
+  silently disable it. `Vault::padding` / `set_padding` expose it.
+- Manifests and directory placeholders are always unpadded.
+
+When padding is not `None`, the container uses **envelope version 2**. The
+wire layout gains one authenticated fixed-width (25 byte) record after the
+header and before the chunk section:
+
+```
+8 real size (BE) ‖ 8 padded size (BE) ‖ 1 mode ‖ 8 fixed bucket (BE)
+```
+
+sealed under nonce `[0xFE; 12]` with AAD `keres-container-v2/padding`.
+
+The chunk section then contains exactly `padded_size` plaintext bytes: the
+real bytes followed by zero-filled padding. Chunk boundaries depend only on
+`padded_size`, so the last record's length reveals only the bucket. The
+trailer's `size` field binds the **padded** length (never the real size),
+so its variable-length JSON does not leak the number of digits in the real
+size. On read, the reader trims to the real size from the prelude and
+normalizes `trailer.size` to it before returning.
+
+Policies (`Padding`):
+
+- `None` — no padding (default, compact format).
+- `Adaptive` — next power of two, clamped to `[4 KiB, 16 MiB]`; larger
+  payloads round to the next multiple of 16 MiB.
+- `Fixed { size }` — next multiple of `size`, which must lie in the same
+  range.
+
+`DecryptReader` supports v2 containers and yields only real plaintext.
+`EncryptWriter` remains unpadded because it cannot know the total length
+upfront.

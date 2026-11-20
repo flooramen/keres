@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
 
+use keres::padding::Padding;
 use keres::prelude::*;
-
 use keres::Vault;
 
 fn vault_root() -> Result<PathBuf> {
@@ -102,6 +102,9 @@ enum Commands {
     Init {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
         vault: String,
+        /// Size-padding policy (none, adaptive, or a fixed bucket like 65536).
+        #[arg(long, default_value = "none")]
+        padding: String,
     },
     /// Add a file or folder to the vault.
     Add {
@@ -163,6 +166,18 @@ enum Commands {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
         vault: String,
     },
+    /// Re-encrypt every entry under a fresh master key (deep rotation).
+    ///
+    /// Unlike change-password, this changes the data key itself. All other
+    /// keyslots and any recovery kit are invalidated, and the vault ends up
+    /// locked under the new password.
+    Rotate {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Rotate without an interactive confirmation.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Verify the integrity of all vault entries (full authentication).
     Verify {
         /// Vault name (stored in `~/.keres/vaults/<name>`).
@@ -170,6 +185,42 @@ enum Commands {
         /// After a successful check, delete blobs that no entry references.
         #[arg(long)]
         prune: bool,
+    },
+    /// Show or change the vault's size-padding policy.
+    Padding {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Set the policy (none, adaptive, or a fixed bucket like 65536).
+        #[arg(long)]
+        set: Option<String>,
+    },
+    /// Remove an entry and rotate the master key (forward key invalidation).
+    Erase {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Name of the file/folder to erase.
+        name: String,
+        /// Erase without an interactive confirmation.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Upgrade a vault written by an older release (0.5.x) to the current format.
+    Migrate {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Migrate without an interactive confirmation.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Create or use a printable recovery kit.
+    Recovery {
+        #[command(subcommand)]
+        action: RecoveryCommands,
+    },
+    /// Manage vault passphrases (keyslots).
+    Keyslot {
+        #[command(subcommand)]
+        action: KeyslotCommands,
     },
     /// Encrypt a single file.
     Encrypt {
@@ -180,6 +231,9 @@ enum Commands {
         /// Overwrite the output if it already exists.
         #[arg(short, long)]
         force: bool,
+        /// Size-padding policy (none, adaptive, or a fixed bucket like 65536).
+        #[arg(long, default_value = "none")]
+        padding: String,
     },
     /// Decrypt a single file.
     Decrypt {
@@ -190,6 +244,44 @@ enum Commands {
         /// Overwrite the output if it already exists.
         #[arg(short, long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCommands {
+    /// Create or replace the vault's printable recovery kit.
+    Create {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Replace an existing kit (its old code stops working).
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Reset the vault password with a recovery code, consuming the kit.
+    Use {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyslotCommands {
+    /// List keyslot ids (stored in plaintext in vault.config).
+    List {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+    },
+    /// Add an additional passphrase that unlocks the same vault.
+    Add {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+    },
+    /// Revoke a keyslot, authorized by a passphrase that will remain.
+    Remove {
+        /// Vault name (stored in `~/.keres/vaults/<name>`).
+        vault: String,
+        /// Keyslot id from `keres keyslot list`.
+        slot: String,
     },
 }
 
@@ -257,6 +349,32 @@ fn prompt_interactive(prompt: &str) -> Result<Zeroizing<String>> {
     }
 }
 
+/// Reads a recovery code directly; password sources do not apply.
+fn read_recovery_code() -> Result<Zeroizing<String>> {
+    let code = prompt_interactive("Recovery code")?;
+    if code.trim().is_empty() {
+        return Err(Error::Operation("recovery code must not be empty".into()));
+    }
+    Ok(code)
+}
+
+/// Reads a new secret twice and checks the entries match.
+///
+/// The first password source may be a file or `KERES_PASSWORD`, so the new
+/// secret is always prompted (or read from the next stdin lines when input is
+/// piped) rather than reusing that source.
+fn read_new_password(prompt: &str) -> Result<Zeroizing<String>> {
+    let first = prompt_interactive(prompt)?;
+    let second = prompt_interactive("Confirm new password")?;
+    if first.as_str() != second.as_str() {
+        return Err(Error::Operation("new passwords don't match".into()));
+    }
+    if first.is_empty() {
+        return Err(Error::Operation("password must not be empty".into()));
+    }
+    Ok(first)
+}
+
 /// Asks for a yes/no answer. Returns an error when there is no terminal to
 /// ask on, so a destructive operation in a script must opt in with `--force`.
 fn confirm(prompt: &str) -> Result<bool> {
@@ -322,6 +440,19 @@ fn print_report(report: &IntegrityReport) {
     }
 }
 
+fn parse_padding(value: &str) -> Result<Padding> {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Ok(Padding::None),
+        "adaptive" => Ok(Padding::Adaptive),
+        other => {
+            let size: u64 = other
+                .parse()
+                .map_err(|_| Error::Operation(format!("unknown padding policy: {value}")))?;
+            Padding::fixed(size)
+        }
+    }
+}
 fn main() {
     let cli = Cli::parse();
     let passwords = PasswordSource {
@@ -336,14 +467,15 @@ fn main() {
 
 fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
     match command {
-        Commands::Init { vault } => {
+        Commands::Init { vault, padding } => {
             let path = new_vault_path(&vault)?;
             let password = passwords.read("Enter vault password")?;
             let confirm = passwords.read("Confirm password")?;
             if password.as_str() != confirm.as_str() {
                 return Err(Error::Operation("passwords don't match".into()));
             }
-            Vault::new(path.clone()).init(password.as_str())?;
+            let padding = parse_padding(&padding)?;
+            Vault::new(path.clone()).init_with_padding(password.as_str(), padding)?;
             println!("Vault '{}' created at {}", vault, path.display());
         }
         Commands::Add { vault, path, name } => {
@@ -425,11 +557,7 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
         Commands::ChangePassword { vault } => {
             let dir = existing_vault_path(&vault)?;
             let old = passwords.read("Current password")?;
-            let new = passwords.read("New password")?;
-            let confirm = passwords.read("Confirm new password")?;
-            if new.as_str() != confirm.as_str() {
-                return Err(Error::Operation("new passwords don't match".into()));
-            }
+            let new = read_new_password("New password")?;
             if new.as_str() == old.as_str() {
                 return Err(Error::Operation(
                     "new password must differ from the current password".into(),
@@ -438,6 +566,111 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
             Vault::new(dir).change_password(old.as_str(), new.as_str())?;
             println!("Password changed successfully!");
         }
+        Commands::Rotate { vault, force } => {
+            let dir = existing_vault_path(&vault)?;
+            let v = Vault::new(dir.clone());
+            let slots = v.keyslots()?.len();
+            let has_kit = v.has_recovery_kit();
+            let extra: Vec<String> = [
+                (slots.saturating_sub(1) > 0).then(|| {
+                    format!(
+                        "{} other keyslot{} will be revoked",
+                        slots - 1,
+                        if slots == 2 { "" } else { "s" }
+                    )
+                }),
+                has_kit.then(|| "the recovery kit will be deleted".to_string()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let consequences = if extra.is_empty() {
+                String::new()
+            } else {
+                format!(" {};", extra.join(" and "))
+            };
+            if !force
+                && !confirm(&format!(
+                    "Rotate vault '{vault}'? Every entry is re-encrypted under a fresh master key;{} the vault is left locked under the new password.",
+                    consequences
+                ))?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let old = passwords.read("Current password")?;
+            let new = read_new_password("New password")?;
+            if new.as_str() == old.as_str() {
+                return Err(Error::Operation(
+                    "new password must differ from the current password".into(),
+                ));
+            }
+            let report = Vault::new(dir).rotate(old.as_str(), new.as_str())?;
+            println!(
+                "Rotated: re-encrypted {} {} ({}).",
+                report.entries,
+                if report.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                format_size(report.bytes)
+            );
+            if report.discarded_keyslots > 0 {
+                println!(
+                    "Revoked {} other keyslot{}.",
+                    report.discarded_keyslots,
+                    if report.discarded_keyslots == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
+            }
+            if report.recovery_kit_removed {
+                println!(
+                    "Removed the old recovery kit; create a new one with `keres recovery create`."
+                );
+            }
+            println!("The vault is locked; unlock it with the new password.");
+        }
+        Commands::Keyslot { action } => match action {
+            KeyslotCommands::List { vault } => {
+                let dir = existing_vault_path(&vault)?;
+                let slots = Vault::new(dir).keyslots()?;
+                println!("{:<20} NOTE", "SLOT");
+                println!("{}", "-".repeat(60));
+                for slot in slots {
+                    let note = if slot.id == "legacy" {
+                        "legacy config; converted on the next key change"
+                    } else {
+                        ""
+                    };
+                    println!("{:<20} {}", slot.id, note);
+                }
+            }
+            KeyslotCommands::Add { vault } => {
+                let dir = existing_vault_path(&vault)?;
+                let current = passwords.read("Current vault password")?;
+                let new = read_new_password("New passphrase")?;
+                if new.as_str() == current.as_str() {
+                    return Err(Error::Operation(
+                        "new passphrase must differ from the current passphrase".into(),
+                    ));
+                }
+                let slot = Vault::new(dir).add_keyslot(current.as_str(), new.as_str())?;
+                println!("Added keyslot {}.", slot.id);
+                println!(
+                    "Store the new passphrase separately; any keyslot unlocks the same vault."
+                );
+            }
+            KeyslotCommands::Remove { vault, slot } => {
+                let dir = existing_vault_path(&vault)?;
+                let password = passwords.read("Password for a keyslot that will remain")?;
+                Vault::new(dir).remove_keyslot(&slot, password.as_str())?;
+                println!("Removed keyslot {slot}.");
+            }
+        },
         Commands::Verify { vault, prune } => {
             let dir = existing_vault_path(&vault)?;
             let password = passwords.read("Enter vault password")?;
@@ -454,16 +687,125 @@ fn run(command: Commands, passwords: &PasswordSource) -> Result<()> {
                 println!("Pruned {removed} orphaned file(s)");
             }
         }
+        Commands::Padding { vault, set } => {
+            let dir = existing_vault_path(&vault)?;
+            let password = passwords.read("Enter vault password")?;
+            let mut v = Vault::new(dir);
+            v.unlock(password.as_str())?;
+            if let Some(value) = set {
+                let padding = parse_padding(&value)?;
+                v.set_padding(padding)?;
+                println!("Padding policy set to {}", padding);
+            } else {
+                let padding = v.padding()?;
+                println!("Padding policy: {}", padding);
+            }
+        }
+        Commands::Erase { vault, name, force } => {
+            let dir = existing_vault_path(&vault)?;
+            if !force
+                && !confirm(&format!(
+                    "Erase '{name}' from vault '{vault}'? This re-encrypts every other entry under a fresh master key."
+                ))?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let password = passwords.read("Enter vault password")?;
+            let new_password = read_new_password("New password after erase")?;
+            if new_password.as_str() == password.as_str() {
+                return Err(Error::Operation(
+                    "new password must differ from the current password".into(),
+                ));
+            }
+            let mut v = Vault::new(dir);
+            v.unlock(password.as_str())?;
+            let report = v.erase(&name, new_password.as_str())?;
+            println!(
+                "Erased '{}': re-encrypted {} {} ({}).",
+                name,
+                report.entries,
+                if report.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                format_size(report.bytes)
+            );
+        }
+        Commands::Migrate { vault, force } => {
+            let dir = existing_vault_path(&vault)?;
+            if !force
+                && !confirm(&format!(
+                    "Migrate vault '{vault}' to the current format? Every entry is re-encrypted in place."
+                ))?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+            let password = passwords.read("Enter vault password")?;
+            let report = Vault::new(dir).migrate(password.as_str())?;
+            println!(
+                "Migrated {} {} ({} re-encrypted).",
+                report.entries,
+                if report.entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                },
+                format_size(report.bytes)
+            );
+        }
+        Commands::Recovery { action } => match action {
+            RecoveryCommands::Create { vault, force } => {
+                let dir = existing_vault_path(&vault)?;
+                let mut v = Vault::new(dir.clone());
+                if v.has_recovery_kit() && !force {
+                    return Err(Error::Operation(format!(
+                        "vault {vault:?} already has a recovery kit; pass --force to replace it (the old code will stop working)"
+                    )));
+                }
+                let password = passwords.read("Enter vault password")?;
+                let code = v.create_recovery_kit(password.as_str())?;
+                println!("Recovery code (store it offline; it will not be shown again):");
+                println!("  {}", code.expose());
+                println!(
+                    "A wrapped copy of the master key was written to {}.",
+                    dir.join("vault.recovery").display()
+                );
+                println!("Keep the code separate from the vault: either alone is not enough.");
+            }
+            RecoveryCommands::Use { vault } => {
+                let dir = existing_vault_path(&vault)?;
+                let code = read_recovery_code()?;
+                let new = read_new_password("New password")?;
+                Vault::new(dir).recover(code.as_str(), new.as_str())?;
+                println!(
+                    "Vault recovered. The recovery kit was consumed; create a new one if needed."
+                );
+            }
+        },
         Commands::Encrypt {
             input,
             output,
             force,
+            padding,
         } => {
             if let Some(out) = &output {
                 refuse_overwrite(out, force)?;
             }
             let password = passwords.read("Enter encryption password")?;
-            let out_path = keres::encrypt_file(password.as_str(), &input, output.as_deref())?;
+            let padding = parse_padding(&padding)?;
+            let out_path = if padding.is_none() {
+                keres::encrypt_file(password.as_str(), &input, output.as_deref())?
+            } else {
+                keres::encrypt_file_with_padding(
+                    password.as_str(),
+                    &input,
+                    output.as_deref(),
+                    padding,
+                )?
+            };
             println!("Encrypted to: {}", out_path.display());
         }
         Commands::Decrypt {

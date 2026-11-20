@@ -12,6 +12,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::container::{self, KeyDerivation, PayloadType};
+use crate::padding::Padding;
 
 use crate::error::{Error, Result};
 
@@ -26,17 +27,37 @@ use crate::error::{Error, Result};
 /// Returns the path of the written container. Output is produced atomically
 /// (temp file + rename) with owner-only permissions on Unix.
 ///
+/// The container is unpadded. Use [`encrypt_file_with_padding`] to hide the
+/// exact plaintext size from someone who can measure the ciphertext.
+///
 /// ```no_run
 /// use std::path::Path;
 /// let out = keres::encrypt_file("correct horse", Path::new("document.pdf"), None).unwrap();
 /// ```
 pub fn encrypt_file(password: &str, input: &Path, output: Option<&Path>) -> Result<PathBuf> {
+    encrypt_file_with_padding(password, input, output, Padding::None)
+}
+
+/// Encrypts `input` into a `.krs` container using `padding`.
+///
+/// Behaves like [`encrypt_file`], but rounds the plaintext up to `padding`'s
+/// bucket before encryption so the ciphertext length reveals only the bucket,
+/// not the exact file size. See [`crate::padding`] for the policies.
+pub fn encrypt_file_with_padding(
+    password: &str,
+    input: &Path,
+    output: Option<&Path>,
+    padding: Padding,
+) -> Result<PathBuf> {
+    padding.validate()?;
+
     let input_path = input
         .canonicalize()
         .map_err(|_| Error::invalid_name(input.display()))?;
     if !input_path.is_file() {
         return Err(Error::invalid_name(input.display()));
     }
+    let source_len = std::fs::metadata(&input_path)?.len();
 
     let original_name = input_path
         .file_name()
@@ -82,6 +103,8 @@ pub fn encrypt_file(password: &str, input: &Path, output: Option<&Path>) -> Resu
                 b"",
                 Some(&mut src),
                 Some(&original_name),
+                padding,
+                Some(source_len),
             )?;
             w.flush()?;
         }

@@ -17,7 +17,7 @@ or, in `Cargo.toml`:
 
 ```toml
 [dependencies]
-keres = "0.4"
+keres = "0.7"
 ```
 
 ## Requirements

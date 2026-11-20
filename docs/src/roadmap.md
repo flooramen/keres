@@ -37,25 +37,32 @@ property will never be accepted for a compatibility or convenience win.
 
 ## Next (0.6.x)
 
-- **v2 → v3 vault migration (0.6.0 blocker)** — 0.5.0 vaults use manifest v2
-  and are rejected by the v3 reader. Add `keres migrate` to stream each blob
-  into a fresh v3 vault with an atomic swap, and make the version error point
-  at it.
-- **Recovery kit** — printable recovery code that wraps the master key
-  under a second Argon2id-derived key, stored alongside `vault.config`.
-  Mitigates the "one config file bricks everything" failure mode without
-  weakening the single-password model.
+- **v2 → v3 vault migration** — 0.5.0 vaults use manifest v2 and are
+  rejected by the v3 reader. *(Done. `Vault::migrate` / `keres migrate`
+  re-encrypts each entry under a fresh ID, commits the v3 manifest atomically,
+  then removes the legacy blobs; the reader reports `MigrationRequired`.)*
+- **Recovery kit** — printable recovery code that wraps the master key under
+  a second Argon2id-derived key, stored alongside `vault.config`. *(Done.
+  `Vault::create_recovery_kit` / `keres recovery create`; `Vault::recover`
+  recreates a lost config, validates the key against the index, and consumes
+  the kit.)*
 - **Multiple keyslots (LUKS-style)** — several independent passphrases per
-  vault, each its own wrapped copy of the master key; individual slots can
-  be revoked. Depends on the config schema gaining a slot table.
+  vault, each its own wrapped copy of the master key; individual slots can be
+  revoked. *(Done. Config v3 stores a slot table; `Vault::add_keyslot` /
+  `remove_keyslot` and `keres keyslot add|remove|list`; v2 configs upgrade on
+  the next key change.)*
 - **Content re-encryption on password change (limitation 2)** — optional
   deep rotation: derive a fresh master key and stream every blob through
-  re-encryption. Slow by design; opt-in only.
+  re-encryption. *(Done. `Vault::rotate` / `keres rotate`; crash-safe via
+  the `vault.rotate` journal, collapses to one keyslot and removes the
+  recovery kit.)*
 - **Parallel chunk pipeline** — encrypt/decrypt chunks across threads
   (counter nonces and AAD already make chunks independent). Target:
   saturate AES-NI (~3–5 GB/s) instead of today's ~400 MB/s single-thread.
 - **Streaming public API** — `Read`/`Write` adapter types so library users
-  can pipe containers without buffering whole objects.
+  can pipe containers without buffering whole objects. *(Done.
+  `keres::streaming::{EncryptWriter, DecryptReader, encrypt_stream,
+  decrypt_stream}` with progress and cancellation.)*
 - **Orphan garbage collection** — after failed adds/removals, blobs may
   exist that no manifest record references. `verify --prune` /
   `Vault::prune_orphans` walks `d/` and deletes unreferenced blobs and stale
@@ -69,16 +76,33 @@ property will never be accepted for a compatibility or convenience win.
   nested-directory tests guard against behavior drift. Considered and
   rejected for now to avoid touching a verified codebase.
 
+## Next (0.7.x)
+
+- **Append-only encrypted index** — stop rewriting the whole manifest on every
+  mutation. *(Done. Snapshot plus `d/.index.log`: authenticated `put`/`delete`
+  batches, per-log keys, snapshot/generation binding, 512-record or 8 MiB
+  compaction, and journaled compaction recovery.)*
+- **Group commit** — coalesce concurrent writers into one durable batch so a
+  busy vault pays for one `sync_data` per group rather than per mutation.
+- **Index generations** — carry a monotonic generation in the snapshot/log
+  header and require them to agree, so replace and compaction swaps are
+  unambiguous. *(Internal generations done; snapshots authenticate the
+  generation and compaction advances it.)* Turning the counter into actual
+  rollback detection still needs hardware-backed state (limitation 6).
+- **L2+ metadata protection** — pad entry sizes to fixed buckets, coarsen
+  observable timing, and optionally bucket mutation counts. Explicit
+  non-goals: access-pattern hiding, exact-count hiding, and deniability.
+
 ## Later (1.0 candidates)
 
 - **Hardware-backed keys** — optional second factor via OS key stores
   (TPM, Secure Enclave, FIDO2/hmac-secret) combined with the password
   (limitation 4). Must remain strictly optional; plain password vaults are
   the default and always supported.
-- **Size hiding (limitation 5)** — optional fixed-size padding buckets
-  for `.krs` output and/or random trailing padding before the end marker,
-  trading space for length privacy. Needs care: padding must be covered by
-  the trailer's authenticated `size`.
+- **Size hiding (limitation 5)** — *implemented (0.7.0, opt-in).* Adaptive
+  and fixed padding buckets for `.krs` output and vault blobs, covered by an
+  authenticated v2 prelude and a trailer that binds the padded length. Timing
+  coarsening, count bucketing, and ORAM remain future work.
 - **External security audit** — pay for a professional review of the
   container format, key hierarchy and implementation before calling 1.0
   production-grade. No amount of internal review substitutes for this.
@@ -92,5 +116,6 @@ property will never be accepted for a compatibility or convenience win.
   hidden-volume schemes conflict with authenticated formats and invite
   user-error catastrophes. Revisit only with a rigorous design.
 - **Backward compatibility shims** — only the current format is accepted.
-  Migration is a one-time `keres migrate` helper only if demand exists.
+  The single exception is the one-way v2 → v3 vault upgrade in
+  `keres migrate`; there is no ongoing reader support for old formats.
 
