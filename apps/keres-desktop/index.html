@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f4f6f8" />
+    <title>Keres Desktop</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="#" aria-label="Keres Desktop home">
+          <span class="brand-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <path d="M16 3.5 26 7v7.8c0 6.7-4.1 11.6-10 14.2C10.1 26.4 6 21.5 6 14.8V7l10-3.5Z" stroke="currentColor" stroke-width="2" />
+              <path d="m11.5 16 3 3 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </span>
+          <span class="brand-name">Keres<span>DESKTOP</span></span>
+        </a>
+
+        <div class="privacy-badge"><span></span> PRIVATE BY DESIGN</div>
+        <p class="nav-caption">WORKSPACE</p>
+        <nav class="side-nav" aria-label="Main navigation">
+          <button class="nav-item active" data-tab="files">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3.75h7l4 4v12.5H7a2 2 0 0 1-2-2v-12.5a2 2 0 0 1 2-2Z"/><path d="M14 3.75v4h4M8.5 13h7M8.5 16.5h7"/></svg>
+            <span>File encryption</span>
+          </button>
+          <button class="nav-item" data-tab="vault">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2"/></svg>
+            <span>Vault</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="local-card">
+            <span class="local-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 3 20 6v6.2c0 4.8-3.1 8.3-8 10.8-4.9-2.5-8-6-8-10.8V6l8-3Z"/><path d="m8.5 12 2.2 2.2 4.8-4.8"/></svg>
+            </span>
+            <div>
+              <strong>On-device protection</strong>
+              <p>Your files are processed locally. No account or cloud upload.</p>
+            </div>
+          </div>
+          <div class="app-version"><span class="version-dot"></span> Keres Desktop <span>v0.1.0</span></div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div class="breadcrumb"><span>WORKSPACE</span><span class="crumb-slash">/</span><strong id="current-page">FILES</strong></div>
+          <div class="device-status"><span></span> Running on this device</div>
+        </header>
+
+        <section id="files" class="view active">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">SECURE FILE WORKSPACE</p>
+              <h1>Keep your files private.</h1>
+              <p class="page-subtitle">Encrypt a file into a protected Keres container, or restore one you already have.</p>
+            </div>
+            <div class="format-chip"><span class="file-glyph">K</span><span><strong>KERES FORMAT</strong><small>Authenticated · Chunked</small></span></div>
+          </div>
+
+          <div class="workflow-grid">
+            <article class="card workflow-card">
+              <div class="mode-switch" role="tablist" aria-label="File operation">
+                <button class="mode-button active" data-mode="encrypt-panel" role="tab" aria-selected="true">Encrypt</button>
+                <button class="mode-button" data-mode="decrypt-panel" role="tab" aria-selected="false">Decrypt</button>
+              </div>
+
+              <section id="encrypt-panel" class="mode-panel active">
+                <div class="card-title-row">
+                  <div class="step-number">01</div>
+                  <div><h2>Encrypt a file</h2><p>Choose what you want to protect.</p></div>
+                </div>
+                <label for="encrypt-source">SOURCE FILE</label>
+                <div class="input-row">
+                  <input id="encrypt-source" type="text" placeholder="Select a file from your device" />
+                  <button class="browse-button browse-file" data-target="encrypt-source">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4m0 0L8 8m4-4 4 4M5 14v5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5"/></svg>
+                    Browse
+                  </button>
+                </div>
+                <label for="encrypt-output">SAVE ENCRYPTED FILE AS</label>
+                <div class="input-row">
+                  <input id="encrypt-output" type="text" placeholder="Choose where to save your .krs file" />
+                  <button class="browse-button save-file" data-target="encrypt-output" data-name="encrypted.krs">Choose</button>
+                </div>
+                <div class="password-label">
+                  <label for="encrypt-password">PASSWORD</label>
+                  <span>Use a strong, unique password</span>
+                </div>
+                <div class="password-wrap">
+                  <input id="encrypt-password" type="password" autocomplete="new-password" placeholder="Enter a password" />
+                  <button class="visibility-button" data-target="encrypt-password" aria-label="Show password" type="button">Show</button>
+                </div>
+                <div class="password-wrap confirm-wrap">
+                  <input id="encrypt-confirm" type="password" autocomplete="new-password" placeholder="Confirm password" />
+                  <button class="visibility-button" data-target="encrypt-confirm" aria-label="Show password" type="button">Show</button>
+                </div>
+                <button id="encrypt-button" class="primary-button">Encrypt file <span aria-hidden="true">→</span></button>
+                <p class="form-footnote"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg> Your password is never saved by Keres Desktop.</p>
+              </section>
+
+              <section id="decrypt-panel" class="mode-panel">
+                <div class="card-title-row">
+                  <div class="step-number">01</div>
+                  <div><h2>Decrypt a file</h2><p>Restore an authenticated Keres container.</p></div>
+                </div>
+                <label for="decrypt-source">KERES CONTAINER</label>
+                <div class="input-row">
+                  <input id="decrypt-source" type="text" placeholder="Select a .krs file from your device" />
+                  <button class="browse-button browse-file" data-target="decrypt-source">Browse</button>
+                </div>
+                <label for="decrypt-output">SAVE RESTORED FILE AS</label>
+                <div class="input-row">
+                  <input id="decrypt-output" type="text" placeholder="Choose where to save the restored file" />
+                  <button class="browse-button save-file" data-target="decrypt-output" data-name="restored-file">Choose</button>
+                </div>
+                <div class="password-label">
+                  <label for="decrypt-password">PASSWORD</label>
+                  <span>Used only for this operation</span>
+                </div>
+                <div class="password-wrap">
+                  <input id="decrypt-password" type="password" autocomplete="current-password" placeholder="Enter the file password" />
+                  <button class="visibility-button" data-target="decrypt-password" aria-label="Show password" type="button">Show</button>
+                </div>
+                <button id="decrypt-button" class="primary-button decrypt-action">Decrypt file <span aria-hidden="true">→</span></button>
+                <p class="form-footnote"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg> Plaintext is committed only after authentication succeeds.</p>
+              </section>
+            </article>
+
+            <aside class="security-panel">
+              <div class="security-illustration" aria-hidden="true">
+                <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+                <div class="shield-art"><svg viewBox="0 0 64 64"><path d="M32 6 52 13v15.6C52 42 43.8 52 32 58 20.2 52 12 42 12 28.6V13L32 6Z"/><path d="m23 32 6 6 13-13"/></svg></div>
+                <span class="spark spark-one"></span><span class="spark spark-two"></span><span class="spark spark-three"></span>
+              </div>
+              <p class="eyebrow">SECURITY, BUILT IN</p>
+              <h2>Privacy isn't an add-on.</h2>
+              <p class="security-copy">Your files are encrypted on your device with the same Keres engine used by the command-line tools.</p>
+              <ul class="security-list">
+                <li><span class="check">✓</span><span><strong>AES-256-GCM</strong><small>Authenticated encryption</small></span></li>
+                <li><span class="check">✓</span><span><strong>Argon2id</strong><small>Memory-hard password protection</small></span></li>
+                <li><span class="check">✓</span><span><strong>Private filenames</strong><small>Original names stay encrypted</small></span></li>
+              </ul>
+              <div class="security-note"><span>i</span><p>File size and access patterns may still be observable. See the security guide for details.</p></div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="vault" class="view">
+          <div class="page-heading vault-heading">
+            <div>
+              <p class="eyebrow">MULTI-FILE STORAGE</p>
+              <h1>Your private vault.</h1>
+              <p class="page-subtitle">Keep files and folders together in one encrypted, password-protected space.</p>
+            </div>
+            <span class="vault-lock-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg>
+            </span>
+          </div>
+
+          <article class="card vault-connection">
+            <div class="vault-fields">
+              <div class="field-wide">
+                <label for="vault-path">VAULT FOLDER</label>
+                <div class="input-row">
+                  <input id="vault-path" type="text" placeholder="Choose an existing vault or an empty folder" />
+                  <button id="vault-browse" class="browse-button">Browse</button>
+                </div>
+              </div>
+              <div>
+                <label for="vault-password">VAULT PASSWORD</label>
+                <div class="password-wrap">
+                  <input id="vault-password" type="password" autocomplete="current-password" placeholder="Enter vault password" />
+                  <button class="visibility-button" data-target="vault-password" aria-label="Show password" type="button">Show</button>
+                </div>
+              </div>
+            </div>
+            <div class="vault-connect-actions">
+              <button id="vault-create" class="text-button">Create new vault</button>
+              <button id="vault-load" class="primary-button compact-button">Open vault <span aria-hidden="true">→</span></button>
+            </div>
+          </article>
+
+          <article class="card entries-card">
+            <div class="entries-header">
+              <div><p class="eyebrow">VAULT CONTENTS</p><h2>Entries</h2></div>
+              <div class="entry-actions">
+                <input id="vault-entry-name" type="text" aria-label="Optional vault entry name" placeholder="Optional entry name" />
+                <button id="vault-add-file" class="secondary-button">＋ Add file</button>
+                <button id="vault-add-folder" class="secondary-button">＋ Add folder</button>
+              </div>
+            </div>
+            <p id="empty-entries" class="empty-state"><span class="empty-icon">◇</span><strong>No vault open</strong><small>Choose a vault folder and open it to view its contents.</small></p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>NAME</th><th>TYPE</th><th>SIZE</th><th></th></tr></thead>
+                <tbody id="entry-list"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <footer class="statusbar">
+          <p id="status" role="status" aria-live="polite"><span class="status-dot"></span> Ready</p>
+          <span>Powered by the Keres Rust library</span>
+        </footer>
+      </main>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

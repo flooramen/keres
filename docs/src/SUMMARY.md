@@ -9,7 +9,7 @@
 - [Using Keres](./usage.md)
   - [Keres library](./library-usage.md)
   - [Keres CLI](./cli-usage.md)
-  - [Keres GUI (separate repository)](./gui-usage.md)
+  - [Keres desktop app](./gui-usage.md)
 - [Architecture](./architecture.md)
 - [Security](./security.md)
 - [Test vectors](./test-vectors.md)

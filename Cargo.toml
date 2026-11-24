@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/keres", "crates/keres-cli"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "apps/keres-desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

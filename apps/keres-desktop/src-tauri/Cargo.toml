@@ -1,0 +1,17 @@
+[package]
+name = "keres-desktop"
+version = "0.1.0"
+description = "Desktop application for Keres file encryption and vaults"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2" }
+
+[dependencies]
+keres = { path = "../../../crates/keres" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2" }
+tauri-plugin-dialog = { version = "2" }
+zeroize = "1.7"

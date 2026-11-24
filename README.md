@@ -11,9 +11,10 @@ secrets. One Rust workspace: engine, CLI, and documentation.
 |---|---|
 | [`crates/keres`](crates/keres) | The library: `.krs` single-file containers and multi-file encrypted vaults |
 | [`crates/keres-cli`](crates/keres-cli) | The `keres` command-line interface |
+| [`apps/keres-desktop`](apps/keres-desktop) | The Tauri desktop application |
 | [`docs`](docs) | The mdBook documentation site |
 
-The GUI and Python bindings live in separate repositories for now.
+Python bindings live in a separate repository.
 
 ## Quick start (CLI)
 
@@ -87,6 +88,9 @@ $ cargo fmt --all -- --check
 $ cargo doc --workspace --no-deps
 $ mdbook serve docs
 ```
+
+The desktop app has its own frontend toolchain; see
+[`apps/keres-desktop/README.md`](apps/keres-desktop/README.md) to run it.
 
 The CI matrix runs the workspace tests on Linux, Windows, and macOS, plus
 the MSRV (1.85) on Linux. It also checks formatting, clippy, rustdoc, and

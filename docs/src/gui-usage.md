@@ -1,11 +1,14 @@
-# Keres GUI (separate repository)
+# Keres desktop app
 
-> The graphical client is currently maintained in a separate repository and is
-> not part of this monorepo. It is not required for the library or the CLI.
+Keres includes a Tauri desktop application in
+[`apps/keres-desktop`](../../apps/keres-desktop). It calls the Rust `keres`
+library directly and currently provides single-file encryption/decryption and
+basic vault management.
 
-The GUI is a showcase of Keres's cryptographic primitives: vaults, file
-encryption, key generation, hashing, and signing. For production file and
-vault workflows, use the CLI or the library documented in this book.
+Follow the app's README for prerequisites and development instructions. The
+CLI and library remain available for terminal and programmatic workflows.
+For Windows, the app can be packaged as an NSIS setup executable and an MSI
+installer; see the app README for local builds and published releases.
 
-The GUI repository will be linked here once it is renamed and moved under the
-Keres organization.
+The app is an early desktop client; the library's documented security model
+and limitations apply to it as well.
