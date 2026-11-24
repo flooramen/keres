@@ -16,6 +16,17 @@ secrets. One Rust workspace: engine, CLI, and documentation.
 
 Python bindings live in a separate repository.
 
+## Windows desktop app
+
+Download and install the latest desktop build:
+
+- [Windows setup (.exe)](https://github.com/flooramen/keres/releases/download/desktop-v0.1.0/Keres.Desktop_0.1.0_x64-setup.exe) (recommended)
+- [Windows installer (.msi)](https://github.com/flooramen/keres/releases/download/desktop-v0.1.0/Keres.Desktop_0.1.0_x64_en-US.msi)
+
+The installer includes the WebView2 runtime; end users do not need Rust,
+Node.js, or a separate runtime installation. Windows may show a SmartScreen
+warning because this build is unsigned.
+
 ## Quick start (CLI)
 
 ```console
