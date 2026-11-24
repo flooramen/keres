@@ -5,6 +5,14 @@ secrets. One Rust workspace: engine, CLI, and documentation.
 
 [Documentation](docs/src/intro.md) · [Security](SECURITY.md) · [Roadmap](ROADMAP.md) · [Contributing](CONTRIBUTING.md)
 
+## Download Keres Desktop for Windows
+
+- [Windows setup (.exe)](https://github.com/flooramen/keres/releases/download/desktop-v0.1.0/Keres.Desktop_0.1.0_x64-setup.exe) (recommended)
+- [Windows installer (.msi)](https://github.com/flooramen/keres/releases/download/desktop-v0.1.0/Keres.Desktop_0.1.0_x64_en-US.msi)
+
+No Rust, Node.js, or separate WebView2 installation is needed. This unsigned
+build may show a Microsoft Defender SmartScreen warning.
+
 ## What is in this repository?
 
 | Path | What it is |
@@ -15,17 +23,6 @@ secrets. One Rust workspace: engine, CLI, and documentation.
 | [`docs`](docs) | The mdBook documentation site |
 
 Python bindings live in a separate repository.
-
-## Windows desktop app
-
-Download and install the latest desktop build:
-
-- [Windows setup (.exe)](https://github.com/flooramen/keres/releases/download/desktop-v0.1.0/Keres.Desktop_0.1.0_x64-setup.exe) (recommended)
-- [Windows installer (.msi)](https://github.com/flooramen/keres/releases/download/desktop-v0.1.0/Keres.Desktop_0.1.0_x64_en-US.msi)
-
-The installer includes the WebView2 runtime; end users do not need Rust,
-Node.js, or a separate runtime installation. Windows may show a SmartScreen
-warning because this build is unsigned.
 
 ## Quick start (CLI)
 
